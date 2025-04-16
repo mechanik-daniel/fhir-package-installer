@@ -40,7 +40,7 @@ describe('fhir-package-installer module', () => {
     };
     setLogger(noopLogger);
 
-    await expect(getPackageIndexFile(fakePackage)).rejects.toMatchObject({ errno: -4058 });
+    await expect(getPackageIndexFile(fakePackage)).rejects.toMatchObject({ code: 'ENOENT' });
 
     setLogger(); // reset logger
   });
