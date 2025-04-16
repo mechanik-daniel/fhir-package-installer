@@ -13,9 +13,9 @@ import {
   getManifest,
   toPackageObject,
   getDependencies
-} from '../src/index';
+} from 'fhir-package-installer';
 
-import { ILogger } from '../src/types/Logger';
+import type { ILogger } from 'fhir-package-installer';
 
 describe('fhir-package-installer module', () => {
   const fakePackage = { id: 'fake-package', version: '1.0.0' };
