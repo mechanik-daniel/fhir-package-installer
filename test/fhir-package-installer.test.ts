@@ -40,7 +40,7 @@ describe('fhir-package-installer module', () => {
     };
     setLogger(noopLogger);
 
-    await expect(getPackageIndexFile(fakePackage)).rejects.toMatchObject({ errno: -4058 });
+    await expect(getPackageIndexFile(fakePackage)).rejects.toMatchObject({ code: 'ENOENT' });
 
     setLogger(); // reset logger
   });
@@ -61,7 +61,7 @@ describe('fhir-package-installer module', () => {
   it('should install the fume package successfully', async () => {
     const result = await install(fumePkg);
     expect(result).toBe(true);
-  });
+  }, 90000); // 90 seconds timeout for installation
 
   it('should get a valid package index file after install', async () => {
     const index = await getPackageIndexFile(fumePkg);
