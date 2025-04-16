@@ -1,6 +1,6 @@
 {
   "name": "fhir-package-installer",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A utility module for downloading, indexing, caching, and managing FHIR packages from the FHIR Package Registry and Simplifier",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -29,16 +29,14 @@
     "url": "git+https://github.com/Outburn-IL/fhir-package-installer.git"
   },
   "scripts": {
-    "build": "rimraf dist && ncc build src/index.ts --minify --out dist",
+    "build": "rimraf dist && ncc build src/index.ts --minify --no-cache --out dist",
     "test": "vitest run"
   },
-  "dependencies": {
-    "axios": "^1.8.4",
+  "dependencies": {},
+  "devDependencies": {
     "fs-extra": "^11.3.0",
     "tar": "^7.4.3",
-    "temp": "^0.9.4"
-  },
-  "devDependencies": {
+    "temp": "^0.9.4",
     "@eslint/js": "^9.24.0",
     "@types/fs-extra": "^11.0.4",
     "@types/temp": "^0.9.4",
