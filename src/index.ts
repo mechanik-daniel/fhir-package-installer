@@ -13,12 +13,14 @@ import * as tar from 'tar';
 import temp from 'temp';
 import os from 'os';
 
-import { FileInPackageIndex } from './types/FileInPackageIndex';
-import { PackageIdentifier } from './types/PackageIdentifier';
-import { PackageIndex } from './types/PackageIndex';
-import { PackageManifest } from './types/PackageManifest';
-import { PackageResource } from './types/PackageResource';
-import { ILogger } from './types/Logger';
+import type {
+  ILogger,
+  FileInPackageIndex,
+  PackageIdentifier,
+  PackageIndex,
+  PackageManifest,
+  PackageResource
+} from './types';
 
 /**
  * default logger uses console.log 
@@ -365,4 +367,14 @@ export const install = async (packageId: string | PackageIdentifier, logger?: IL
   };
   return true;
 };
+
+export type {
+  ILogger,
+  PackageIdentifier,
+  PackageIndex,
+  PackageManifest,
+  FileInPackageIndex,
+  PackageResource
+} from './types';
+
 
