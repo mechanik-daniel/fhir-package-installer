@@ -3,16 +3,33 @@
   "version": "1.0.0",
   "description": "A utility module for downloading, indexing, caching, and managing FHIR packages from the FHIR Package Registry and Simplifier",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "type": "module",
   "author": "Outburn Ltd.",
   "license": "MIT",
+  "keywords": [
+    "fhir",
+    "hl7",
+    "package",
+    "install",
+    "installer",
+    "npm",
+    "registry",
+    "simplifier",
+    "cache",
+    "download"
+  ],
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Outburn-IL/fhir-package-installer.git"
+  },
   "scripts": {
-    "build": "ncc build src/index.ts --minify --out dist",
+    "build": "rimraf dist && ncc build src/index.ts --minify --out dist",
     "test": "vitest run"
   },
   "dependencies": {
@@ -28,6 +45,7 @@
     "@vercel/ncc": "^0.38.3",
     "eslint": "^9.24.0",
     "globals": "^16.0.0",
+    "rimraf": "^6.0.1",
     "tslib": "^2.8.1",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.30.1",
