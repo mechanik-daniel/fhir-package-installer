@@ -4,7 +4,7 @@
  *   Project name: FHIR-Package-Installer
  */
 
-import axios from 'axios';
+import https from 'https';
 import fs from 'fs-extra';
 import path from 'path';
 import { Readable } from 'stream';
@@ -193,9 +193,42 @@ const getVersionFromPackageString = (packageId: string): string => {
  * @param packageName Only the package name (no version)
  * @returns The response object from the registry
  */
+function fetchJson(url: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse JSON from ${url}: ${e}`));
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+/**
+ * Fetches a readable stream from a given URL
+ * Used to stream tarball downloads
+ * @param url The URL to fetch
+ * @returns Readable stream
+ */
+function fetchStream(url: string): Promise<Readable> {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      if (res.statusCode === 200) {
+        resolve(res);
+      } else {
+        reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
+      }
+    }).on('error', reject);
+  });
+}
+
 const getPackageDataFromRegistry = async (packageName: string): Promise<Record<string, any | any[]>> => {
-  const packageData = await axios.get(`${registryUrl}/${packageName}/`);
-  return packageData.data;
+  return await fetchJson(`${registryUrl}/${packageName}/`);
 };
 
 /**
@@ -254,27 +287,18 @@ const cachePackageTarball = async (packageObject: PackageIdentifier, tempDirecto
   return finalPath;
 };
 
-/**
- * Downloads the tarball file into a temp folder and returns the path
- * @param packageObject
- */
 const downloadTarball = async (packageObject: PackageIdentifier): Promise<string> => {
   const tarballUrl: string = await getTarballUrl(packageObject);
-  const res = await axios.get(tarballUrl, { responseType: 'stream' });
-  if (res?.status === 200 && res?.data) {
-    try {
-      const tarballStream: Readable = res.data;
-      temp.track();
-      const tempDirectory = temp.mkdirSync();
-      await pipeline(tarballStream, tar.x({ cwd: tempDirectory }));
-      getLogger().info(`Downloaded ${packageObject.id}@${packageObject.version} to a temporary directory`);
-      return tempDirectory;
-    } catch (e) {
-      getLogger().error(`Failed to extract tarball of package ${packageObject.id}@${packageObject.version}`);
-      throw e;
-    }
-  } else {
-    throw new Error(`Failed to download package ${packageObject.id}@${packageObject.version} from URL: ${tarballUrl}`);
+  const tarballStream = await fetchStream(tarballUrl);
+  try {
+    temp.track();
+    const tempDirectory = temp.mkdirSync();
+    await pipeline(tarballStream, tar.x({ cwd: tempDirectory }));
+    getLogger().info(`Downloaded ${packageObject.id}@${packageObject.version} to a temporary directory`);
+    return tempDirectory;
+  } catch (e) {
+    getLogger().error(`Failed to extract tarball of package ${packageObject.id}@${packageObject.version}`);
+    throw e;
   }
 };
 
