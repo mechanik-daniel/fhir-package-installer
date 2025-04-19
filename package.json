@@ -30,7 +30,7 @@
   },
   "scripts": {
     "build": "rimraf dist && ncc build src/index.ts --minify --no-cache --out dist",
-    "pretest": "rimraf node_modules/fhir-package-installer && npm run build && node -e \"require('./dist-to-module.cjs')()\"",
+    "pretest": "rimraf node_modules/fhir-package-installer && npm run build && node -e \"require('./test/dist-to-module.cjs')()\"",
     "test": "vitest run"
   },
   "devDependencies": {
