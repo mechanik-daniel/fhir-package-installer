@@ -4,3 +4,4 @@ export type { PackageIndex } from './PackageIndex';
 export type { PackageManifest } from './PackageManifest';
 export type { PackageResource } from './PackageResource';
 export type { FileInPackageIndex } from './FileInPackageIndex';
+export type { FpiConfig } from './FpiConfig';
