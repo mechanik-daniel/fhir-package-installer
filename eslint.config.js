@@ -5,7 +5,7 @@ import { defineConfig } from 'eslint/config';
 
 
 export default defineConfig([
-  { files: ['**/*.{js,mjs,cjs,ts}'], plugins: { js }, extends: ['js/recommended'], ignores: ['**/node_modules/**', '**/dist/**'], languageOptions: { globals: globals.node }},
+  { files: ['**/*.{js,mjs,cjs,ts}'], plugins: { js }, extends: ['js/recommended'], ignores: ['**/node_modules/**', '**/dist/**', 'test/.test-cache/**'], languageOptions: { globals: globals.node }},
   { files: ['**/*.{js,mjs,cjs,ts}'], languageOptions: { globals: globals.browser },
     rules: {
       indent: ['error', 2],

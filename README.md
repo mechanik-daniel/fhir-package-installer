@@ -6,13 +6,13 @@ A utility module for downloading, indexing, caching, and managing [FHIR](https:/
 
 ## Features
 
-- Download and install FHIR NPM-style packages (e.g., `hl7.fhir.r4.core@4.0.1`)
-- Cache downloaded packages locally under `~/.fhir/packages`
+- Download and install [FHIR NPM-style packages](https://hl7.org/fhir/packages.html) (e.g., `hl7.fhir.uv.sdc@3.0.0`)
+- Cache downloaded packages locally in the [FHIR Package Cache](https://confluence.hl7.org/spaces/FHIR/pages/66928417/FHIR+Package+Cache) or a path if defined in the constructor.
 - Automatically resolve `latest` versions
 - Generate and retrieve a local index (`.fpi.index.json`) of all FHIR JSON files in the package
 - Fetch `package.json` manifest and dependencies
 - Recursively install required dependencies
-- Supports custom logging
+- Customizable registry URL, logger, and cache location
 
 ---
 
@@ -24,62 +24,119 @@ npm install fhir-package-installer
 
 ---
 
-## Usage
+## Quick Start (Default Usage)
 
-### Install a FHIR Package
 ```ts
-import { install } from 'fhir-package-installer';
+import fpi from 'fhir-package-installer';
 
-await install('hl7.fhir.r4.core@4.0.1');
-```
-Supports `name@version`, `name#version`, or just `name` (uses latest).
+await fpi.install('hl7.fhir.r4.core@4.0.1');
 
-### Set Custom Logger
-```ts
-import { setLogger } from 'fhir-package-installer';
-
-setLogger({
-  info: msg => console.log('[INFO]', msg),
-  warn: msg => console.warn('[WARN]', msg),
-  error: msg => console.error('[ERROR]', msg)
-});
-```
-The custom logger will be used by any subsequent calls to any of the module's functions.
-
-### Get Package Directory Path
-```ts
-import { getPackageDirPath, toPackageObject } from 'fhir-package-installer';
-
-const pkg = await toPackageObject('hl7.fhir.r4.core');
-const dir = getPackageDirPath(pkg);
-```
-
-### Access Package Manifest
-```ts
-import { getManifest } from 'fhir-package-installer';
-
-const manifest = await getManifest({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
-```
-
-### Access Package Index
-```ts
-import { getPackageIndexFile } from 'fhir-package-installer';
-
-const index = await getPackageIndexFile({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
+const manifest = await fpi.getManifest({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
+const index = await fpi.getPackageIndexFile({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
 ```
 
 ---
 
-## Cache Location
-Packages are cached to:
-```bash
-~/.fhir/packages/<name>#<version>
+## Advanced Usage (Custom Configurations)
+
+Use the `FhirPackageInstaller` class directly to customize behavior:
+
+```ts
+import { FhirPackageInstaller } from 'fhir-package-installer';
+
+const customFpi = new FhirPackageInstaller({
+  logger: {
+    info: msg => console.log('[INFO]', msg),
+    warn: msg => console.warn('[WARN]', msg),
+    error: msg => console.error('[ERROR]', msg)
+  },
+  registryUrl: 'https://packages.fhir.org',
+  cachePath: './my-fhir-cache'
+});
+
+await customFpi.install('hl7.fhir.r4.core');
 ```
+
+### `FpiConfig` fields:
+- `logger` – Optional. Custom logger implementing the `ILogger` interface.
+- `registryUrl` – Optional. Custom package registry base URL.
+- `cachePath` – Optional. Directory where packages will be cached.
+
+---
+
+## Public API Methods
+
+### `install(packageId: string | PackageIdentifier): Promise<boolean>`
+Downloads and installs a package and all its dependencies.
+
+### `getManifest(pkg: PackageIdentifier): Promise<PackageManifest>`
+Fetches the `package.json` manifest of an installed package.
+
+### `getPackageIndexFile(pkg: PackageIdentifier): Promise<PackageIndex>`
+Returns the `.fpi.index.json` content for the package.
+If the file doesn't exist, it will be generated automatically.
+
+### `getDependencies(pkg: PackageIdentifier): Promise<Record<string, string>>`
+Parses dependencies listed in the package's `package.json`.
+
+### `checkLatestPackageDist(packageId: string): Promise<string>`
+Looks up the latest published version for a given package name.
+
+### `toPackageObject(id: string): Promise<PackageIdentifier>`
+Parses `name`, `name@version`, or `name#version` into an object with `id` and `version`. If no version is provided, resolves to the latest.
+
+### `isInstalled(pkg: PackageIdentifier): boolean`
+Returns `true` if the package is already in the local cache.
+
+### `getCachePath(): string`
+Returns the root cache directory used by this installer.
+
+### `getPackageDirPath(pkg: PackageIdentifier): string`
+Returns the path to a specific package folder in the cache.
+
+---
+
+## Package Cache Directory
+
+Location of the default global package cache differs per operating system.
+
+Windows: 
+```
+c:\users\<username>\.fhir\packages
+```
+
+Unix/Linux: 
+```
+/~/.fhir/packages
+```
+
+### For system services (daemons):
+
+Windows: 
+```
+c:\ProgramData\.fhir\packages
+```
+Unix/Linux: 
+```
+/var/lib/.fhir/packages
+```  
+
+Note: In Windows, ProgramData is defined by the environment variable ProgramData. The package cache will use the location indicated by this environment variable.
+
+The package cache root folder contains a folder per package where the folder name is the package name, a pound and the package version.
+
+ `hl7.fhir.us.core#0.1.1`
 
 ---
 
 ## Index Format: `.fpi.index.json`
-Each package gets a generated index of its FHIR JSON files:
+
+Each installed package is scanned for JSON files in the `package/` subdirectory (excluding `package.json` and any `.index.json` files). A generated index is written to:
+```bash
+<packagePath>/package/.fpi.index.json
+```
+
+Sample structure:
 ```json
 {
   "index-version": 2,
@@ -89,22 +146,24 @@ Each package gets a generated index of its FHIR JSON files:
       "resourceType": "StructureDefinition",
       "id": "something",
       "url": "http://...",
-      "kind": "resource", // StructureDefinition resources only
+      "kind": "resource",
       "name": "Something",
       "version": "1.0.0",
       "type": "Observation",
-      "supplements": "http://...", // CodeSystem resources only
-      "content": "complete", // CodeSystem resources only
-      "baseDefinition": "http://...", // StructureDefinition resources only
-      "derivation": "constraint", // StructureDefinition resources only
+      "supplements": "http://...",
+      "content": "complete",
+      "baseDefinition": "http://...",
+      "derivation": "constraint",
       "date": "2020-01-01"
     }
   ]
 }
 ```
 
-The attributes are populated from the corresponding attribute in the resource JSON file. If an attribute does not exist in the resource, it will be missing from the index.  
-*Note:* This index file is simillar, but not identical, to the official `.package.index` defined in the FHIR Package NPM specification. the `.fpi.index.json` has extra attributes defined so tools can fetch important information missing from the official spec without needing to read and parse the whole resource content.
+**Notes:**
+- All fields are optional and, with the exception of `filename`, populated directly from the original JSON resource.
+- This index is an enhanced alternative to the [`.package.index`](https://hl7.org/fhir/packages.html#2.1.10.4) format in the FHIR NPM spec.
+- Intended to optimize access to key metadata for tools like validators and template generators.
 
 ---
 
