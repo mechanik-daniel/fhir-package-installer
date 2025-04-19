@@ -7,7 +7,7 @@ A utility module for downloading, indexing, caching, and managing [FHIR](https:/
 ## Features
 
 - Download and install [FHIR NPM-style packages](https://hl7.org/fhir/packages.html) (e.g., `hl7.fhir.uv.sdc@3.0.0`)
-- Cache downloaded packages locally in the [FHIR Package Cache](https://confluence.hl7.org/spaces/FHIR/pages/66928417/FHIR+Package+Cache) or a path if defined in the constructor.
+- Cache downloaded packages locally in the [FHIR Package Cache](https://confluence.hl7.org/spaces/FHIR/pages/66928417/FHIR+Package+Cache) or a custom path if defined in the constructor.
 - Automatically resolve `latest` versions
 - Generate and retrieve a local index (`.fpi.index.json`) of all FHIR JSON files in the package
 - Fetch `package.json` manifest and dependencies
@@ -31,7 +31,6 @@ import fpi from 'fhir-package-installer';
 
 await fpi.install('hl7.fhir.r4.core@4.0.1');
 
-const manifest = await fpi.getManifest({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
 const index = await fpi.getPackageIndexFile({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
 ```
 
@@ -98,6 +97,8 @@ Returns the path to a specific package folder in the cache.
 
 ## Package Cache Directory
 
+### Location
+
 Location of the default global package cache differs per operating system.
 
 Windows: 
@@ -121,17 +122,19 @@ Unix/Linux:
 /var/lib/.fhir/packages
 ```  
 
-Note: In Windows, ProgramData is defined by the environment variable ProgramData. The package cache will use the location indicated by this environment variable.
+### Folder Structure
+The package cache root folder contains a folder per package where the folder name is the package name, a pound and the package version:
 
-The package cache root folder contains a folder per package where the folder name is the package name, a pound and the package version.
-
- `hl7.fhir.us.core#0.1.1`
+- `package-cache-folder`
+  - `hl7.fhir.us.core#0.1.1`
+  - `hl7.fhir.r4.core#4.0.1`
+  - `hl7.fhir.uv.sdc#3.0.0`
 
 ---
 
 ## Index Format: `.fpi.index.json`
 
-Each installed package is scanned for JSON files in the `package/` subdirectory (excluding `package.json` and any `.index.json` files). A generated index is written to:
+Each installed package is scanned for JSON files in the `package/` subdirectory (excluding `package.json` and any `[*].index.json` files). A generated index is written to:
 ```bash
 <packagePath>/package/.fpi.index.json
 ```
@@ -162,7 +165,7 @@ Sample structure:
 
 **Notes:**
 - All fields are optional and, with the exception of `filename`, populated directly from the original JSON resource.
-- This index is an enhanced alternative to the [`.package.index`](https://hl7.org/fhir/packages.html#2.1.10.4) format in the FHIR NPM spec.
+- This index is an enhanced alternative to the [`.index.json`](https://hl7.org/fhir/packages.html#2.1.10.4) format in the FHIR NPM spec.
 - Intended to optimize access to key metadata for tools like validators and template generators.
 
 ---
