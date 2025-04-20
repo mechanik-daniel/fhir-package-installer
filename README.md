@@ -90,6 +90,9 @@ Returns `true` if the package is already in the local cache.
 ### `getCachePath(): string`
 Returns the root cache directory used by this installer.
 
+### `getLogger(): ILogger`
+Returns the logger instance used by this installer.
+
 ### `getPackageDirPath(pkg: PackageIdentifier): string`
 Returns the path to a specific package folder in the cache.
 
@@ -115,7 +118,7 @@ Unix/Linux:
 
 Windows: 
 ```
-c:\ProgramData\.fhir\packages
+C:\Windows\System32\config\systemprofile\.fhir\packages
 ```
 Unix/Linux: 
 ```
