@@ -261,6 +261,14 @@ export class FhirPackageInstaller {
     return this.cachePath;
   }
 
+  /**
+   * Get the logger instance used by this FhirPackageInstaller.
+  */
+
+  public getLogger(): ILogger {
+    return this.logger;
+  }
+
   public async getDependencies(packageObject: PackageIdentifier) {
     return (await this.getManifest(packageObject))?.dependencies;
   }
