@@ -22,7 +22,8 @@ describe('fhir-package-installer module', () => {
   const silentFpi = new FhirPackageInstaller({ logger: noopLogger });
   const customCachePath = path.join(path.resolve('.'), 'test', '.test-cache');
   const customCacheFpi = new FhirPackageInstaller({
-    cachePath: customCachePath
+    cachePath: customCachePath,
+    skipExamples: true
   });
 
   beforeAll(async () => {
@@ -108,13 +109,13 @@ describe('fhir-package-installer module', () => {
     });
   });
 
-  it('should get true for isInstalled on all dependencies of test package', async () => {
+  it('should get true for isInstalled on all non-example dependencies of test package', async () => {
     expect({
       'hl7.fhir.r4.core': await customCacheFpi.isInstalled({ id: 'hl7.fhir.r4.core', version: '4.0.1' }),
       'hl7.fhir.r4.examples': await customCacheFpi.isInstalled({ id: 'hl7.fhir.r4.examples', version: '4.0.1' })
     }).toMatchObject({
       'hl7.fhir.r4.core': true,
-      'hl7.fhir.r4.examples': true
+      'hl7.fhir.r4.examples': false
     });
   });
 });
