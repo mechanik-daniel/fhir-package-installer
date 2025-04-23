@@ -6,6 +6,7 @@
 
 import https from 'https';
 import fs from 'fs-extra';
+import pLimit from 'p-limit';
 import path from 'path';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
@@ -31,6 +32,38 @@ const defaultLogger: ILogger = {
   warn: (msg: any) => console.warn(msg),
   error: (msg: any) => console.error(msg)
 };
+
+/**
+ * Max number of concurrent open files
+ */
+const limit = pLimit(64);
+
+async function withRetries<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  delayMs = 5000
+): Promise<T> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const isTemporary =
+        err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND' || err.code === 'ECONNRESET';
+
+      if (!isTemporary || attempt === retries) {
+        throw err;
+      }
+
+      console.warn(
+        `⚠️ Attempt ${attempt} failed (${err.code || err.message}), retrying in ${delayMs}ms...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
 
 export class FhirPackageInstaller {
   private logger: ILogger = defaultLogger;
@@ -104,7 +137,8 @@ export class FhirPackageInstaller {
         fileList.filter(
           file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
         ).map(
-          async (file: string) => {
+          file =>
+            limit(async () => {
             const content: PackageResource = await fs.readJSON(path.join(packagePath, 'package', file), { encoding: 'utf8' });
             const indexEntry: FileInPackageIndex = {
               filename: file,
@@ -123,7 +157,7 @@ export class FhirPackageInstaller {
             };
             return indexEntry;
           }
-        )
+            ))
       );
       const indexJson: PackageIndex = {
         'index-version': 2,
@@ -138,10 +172,10 @@ export class FhirPackageInstaller {
   }
 
   private fetchJson(url: string): Promise<any> {
-    return new Promise((resolve, reject) => {
-      https.get(url, res => {
+    return withRetries(() => new Promise((resolve, reject) => {
+      https.get(url, (res) => {
         let data = '';
-        res.on('data', chunk => data += chunk);
+        res.on('data', (chunk) => (data += chunk));
         res.on('end', () => {
           try {
             resolve(JSON.parse(data));
@@ -150,19 +184,19 @@ export class FhirPackageInstaller {
           }
         });
       }).on('error', reject);
-    });
+    }));
   }
 
   private fetchStream(url: string): Promise<Readable> {
-    return new Promise((resolve, reject) => {
-      https.get(url, res => {
+    return withRetries(() => new Promise((resolve, reject) => {
+      https.get(url, (res) => {
         if (res.statusCode === 200) {
           resolve(res);
         } else {
           reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
         }
       }).on('error', reject);
-    });
+    }));
   }
 
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
