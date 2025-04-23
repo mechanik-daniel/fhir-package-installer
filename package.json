@@ -1,6 +1,6 @@
 {
   "name": "fhir-package-installer",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "A utility module for downloading, indexing, caching, and managing FHIR packages from the FHIR Package Registry and Simplifier",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -30,7 +30,9 @@
   },
   "scripts": {
     "build": "rimraf dist && ncc build src/index.ts --external fs-extra --minify --no-cache --out dist",
-    "pretest": "rimraf node_modules/fhir-package-installer && npm run build && node -e \"require('./test/dist-to-module.cjs')()\"",
+    "dist-to-module": "rimraf node_modules/fhir-package-installer && npm run build && node test/dist-to-module.js",
+    "check-registries": "node test/checkRegistriesAvailable.js",
+    "pretest": "npm run dist-to-module && npm run check-registries",
     "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
@@ -44,6 +46,7 @@
     "@vercel/ncc": "^0.38.3",
     "eslint": "^9.24.0",
     "globals": "^16.0.0",
+    "p-limit": "^6.2.0",
     "rimraf": "^6.0.1",
     "tar": "^7.4.3",
     "temp": "^0.9.4",
