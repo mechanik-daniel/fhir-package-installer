@@ -60,6 +60,7 @@ await customFpi.install('hl7.fhir.r4.core');
 - `logger` – Optional. Custom logger implementing the `ILogger` interface.
 - `registryUrl` – Optional. Custom package registry base URL.
 - `cachePath` – Optional. Directory where packages will be cached.
+- `skipExamples` – Optional. Don't install dependencies that have `examples` in the package name
 
 ---
 
