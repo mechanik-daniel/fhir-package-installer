@@ -99,8 +99,9 @@ export class FhirPackageInstaller {
    * @param packageObject A PackageObject with both name and version keys
    * @returns (string) Directory name in the standard format `name#version`
    */
-  private toDirName(packageObject: PackageIdentifier): string {
-    return packageObject.id + '#' + packageObject.version;
+  private async toDirName(packageId: PackageIdentifier | string): Promise<string> {
+    packageId = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    return packageId.id + '#' + packageId.version;
   }
 
   /**
@@ -108,8 +109,8 @@ export class FhirPackageInstaller {
    * @param packageObject A PackageIdentifier Object with both name and version keys
    * @returns The full path to the package directory
    */
-  public getPackageDirPath(packageObject: PackageIdentifier): string {
-    return path.join(this.cachePath, this.toDirName(packageObject));
+  public async getPackageDirPath(packageId: PackageIdentifier | string): Promise<string> {
+    return path.join(this.cachePath, await this.toDirName(packageId));
   }
 
   /**
@@ -117,8 +118,8 @@ export class FhirPackageInstaller {
    * @param packageObject A PackageIdentifier Object with both name and version keys
    * @returns (string) The path to the package index file
    */
-  private getPackageIndexPath(packageObject: PackageIdentifier): string {
-    return path.join(this.getPackageDirPath(packageObject), 'package', '.fpi.index.json');
+  private async getPackageIndexPath(packageId: PackageIdentifier | string): Promise<string> {
+    return path.join(await this.getPackageDirPath(packageId), 'package', '.fpi.index.json');
   }
 
   /**
@@ -126,10 +127,11 @@ export class FhirPackageInstaller {
    * @param packageObject The package identifier object
    * @returns PackageIndex
    */
-  private async generatePackageIndex(packageObject: PackageIdentifier): Promise<PackageIndex> {
-    this.logger.info(`Generating new .fpi.index.json file for package ${packageObject.id}@${packageObject.version}...`);
-    const packagePath = this.getPackageDirPath(packageObject);
-    const indexPath = this.getPackageIndexPath(packageObject);
+  private async generatePackageIndex(packageId: PackageIdentifier | string): Promise<PackageIndex> {
+    const pckIdObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    this.logger.info(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
+    const packagePath = await this.getPackageDirPath(pckIdObj);
+    const indexPath = await this.getPackageIndexPath(pckIdObj);
     const evalAttribute = (att: any | any[]) => (typeof att === 'string' ? att : undefined);
     try {
       const fileList = await fs.readdir(path.join(packagePath, 'package'));
@@ -228,8 +230,9 @@ export class FhirPackageInstaller {
   }
 
   private async cachePackageTarball(packageObject: PackageIdentifier, tempDirectory: string): Promise<string> {
-    const finalPath = this.getPackageDirPath(packageObject);
-    if (!this.isInstalled(packageObject)) {
+    const finalPath = await this.getPackageDirPath(packageObject);
+    const isInstalled = await this.isInstalled(packageObject);
+    if (!isInstalled) {
       await fs.move(tempDirectory, finalPath);
       this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
     }
@@ -250,16 +253,16 @@ export class FhirPackageInstaller {
     return 'latest';
   }
 
-  public isInstalled(packageObject: PackageIdentifier): boolean {
-    return fs.existsSync(this.getPackageDirPath(packageObject));
+  public async isInstalled(packageId: PackageIdentifier | string): Promise<boolean> {
+    return await fs.exists(await this.getPackageDirPath(packageId));
   }
 
-  public async getPackageIndexFile(packageObject: PackageIdentifier): Promise<PackageIndex> {
-    const indexPath = this.getPackageIndexPath(packageObject);
+  public async getPackageIndexFile(packageId: PackageIdentifier | string): Promise<PackageIndex> {
+    const indexPath = await this.getPackageIndexPath(packageId);
     if (await fs.exists(indexPath)) {
       return await fs.readJSON(indexPath, { encoding: 'utf8' });
     }
-    return await this.generatePackageIndex(packageObject);
+    return await this.generatePackageIndex(packageId);
   }
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
@@ -267,21 +270,43 @@ export class FhirPackageInstaller {
     return packageData['dist-tags']?.latest;
   }
 
-  public async toPackageObject(packageId: string): Promise<PackageIdentifier> {
-    const packageName = packageId.split('#')[0].split('@')[0];
-    let packageVersion = this.getVersionFromPackageString(packageId);
-    if (packageVersion === 'latest') packageVersion = await this.checkLatestPackageDist(packageName);
+  public async toPackageObject(packageId: string | PackageIdentifier): Promise<PackageIdentifier> {
+    let packageVersion: string;
+    let packageName: string;
+    if (typeof packageId === 'string') {
+      packageId = packageId.trim();
+      if (packageId.length === 0) {
+        this.logger.error('Invalid package identifier: empty string');
+        throw new Error('Invalid package identifier: empty string');
+      }
+      packageName = packageId.split('#')[0].split('@')[0];
+      packageVersion = this.getVersionFromPackageString(packageId);
+    } else {
+      packageName = packageId.id;
+      packageVersion = packageId.version || 'latest';
+    }
+    if (packageVersion === 'latest') {
+      try {
+        packageVersion = await this.checkLatestPackageDist(packageName);
+      } catch (e) {
+        this.logger.error(`Failed to fetch latest version for package ${packageName}`);
+        throw e;
+      }
+    }
     return { id: packageName, version: packageVersion };
   }
 
-  public async getManifest(packageObject: PackageIdentifier): Promise<PackageManifest> {
-    const manifestPath = path.join(this.getPackageDirPath(packageObject), 'package', 'package.json');
+  public async getManifest(packageId: string | PackageIdentifier): Promise<PackageManifest> {
+    if (typeof packageId === 'string') {
+      packageId = await this.toPackageObject(packageId);
+    }
+    const manifestPath = path.join(await this.getPackageDirPath(packageId), 'package', 'package.json');
     const manifestFile = await fs.readJSON(manifestPath, { encoding: 'utf8' });
     if (manifestFile) {
       return manifestFile;
     } else {
-      this.logger.warn(`Could not find package manifest for ${packageObject.id}@${packageObject.version}`);
-      return { name: packageObject.id, version: packageObject.version };
+      this.logger.warn(`Could not find package manifest for ${packageId.id}@${packageId.version}`);
+      return { name: packageId.id, version: packageId.version };
     }
   }
 
@@ -319,8 +344,8 @@ export class FhirPackageInstaller {
     } else {
       packageObject = packageId;
     }
-
-    if (!this.isInstalled(packageObject)) {
+    const alreadyInstalled = await this.isInstalled(packageObject);
+    if (!alreadyInstalled) {
       try {
         const tempPath = await this.downloadTarball(packageObject);
         await this.cachePackageTarball(packageObject, tempPath);
