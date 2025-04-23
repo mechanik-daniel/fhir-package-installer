@@ -141,24 +141,24 @@ export class FhirPackageInstaller {
         ).map(
           file =>
             limit(async () => {
-            const content: PackageResource = await fs.readJSON(path.join(packagePath, 'package', file), { encoding: 'utf8' });
-            const indexEntry: FileInPackageIndex = {
-              filename: file,
-              resourceType: content.resourceType,
-              id: content.id,
-              url: evalAttribute(content.url),
-              name: evalAttribute(content.name),
-              version: evalAttribute(content.version),
-              kind: evalAttribute(content.kind),
-              type: evalAttribute(content.type),
-              supplements: evalAttribute(content.supplements),
-              content: evalAttribute(content.content),
-              baseDefinition: evalAttribute(content.baseDefinition),
-              derivation: evalAttribute(content.derivation),
-              date: evalAttribute(content.date)
-            };
-            return indexEntry;
-          }
+              const content: PackageResource = await fs.readJSON(path.join(packagePath, 'package', file), { encoding: 'utf8' });
+              const indexEntry: FileInPackageIndex = {
+                filename: file,
+                resourceType: content.resourceType,
+                id: content.id,
+                url: evalAttribute(content.url),
+                name: evalAttribute(content.name),
+                version: evalAttribute(content.version),
+                kind: evalAttribute(content.kind),
+                type: evalAttribute(content.type),
+                supplements: evalAttribute(content.supplements),
+                content: evalAttribute(content.content),
+                baseDefinition: evalAttribute(content.baseDefinition),
+                derivation: evalAttribute(content.derivation),
+                date: evalAttribute(content.date)
+              };
+              return indexEntry;
+            }
             ))
       );
       const indexJson: PackageIndex = {
@@ -187,7 +187,7 @@ export class FhirPackageInstaller {
         });
       }).on('error', reject);
     }));
-  }
+  }  
 
   private fetchStream(url: string): Promise<Readable> {
     return withRetries(() => new Promise((resolve, reject) => {
@@ -199,7 +199,7 @@ export class FhirPackageInstaller {
         }
       }).on('error', reject);
     }));
-  }
+  }  
 
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
     return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
