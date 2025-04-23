@@ -66,34 +66,54 @@ await customFpi.install('hl7.fhir.r4.core');
 ## Public API Methods
 
 ### `install(packageId: string | PackageIdentifier): Promise<boolean>`
-Downloads and installs a package and all its dependencies.
+Downloads and installs a package and all its dependencies.  
+Accepts either a package identifier object (`{ id, version }`) or a string (`'name@version'`, `'name#version'`, or `'name'`).
 
-### `getManifest(pkg: PackageIdentifier): Promise<PackageManifest>`
+---
+
+### `getManifest(packageId: string | PackageIdentifier): Promise<PackageManifest>`
 Fetches the `package.json` manifest of an installed package.
 
-### `getPackageIndexFile(pkg: PackageIdentifier): Promise<PackageIndex>`
-Returns the `.fpi.index.json` content for the package.
+---
+
+### `getPackageIndexFile(packageId: string | PackageIdentifier): Promise<PackageIndex>`
+Returns the `.fpi.index.json` content for the package.  
 If the file doesn't exist, it will be generated automatically.
 
-### `getDependencies(pkg: PackageIdentifier): Promise<Record<string, string>>`
+---
+
+### `getDependencies(packageId: string | PackageIdentifier): Promise<Record<string, string>>`
 Parses dependencies listed in the package's `package.json`.
 
-### `checkLatestPackageDist(packageId: string): Promise<string>`
-Looks up the latest published version for a given package name.
+---
 
-### `toPackageObject(id: string): Promise<PackageIdentifier>`
-Parses `name`, `name@version`, or `name#version` into an object with `id` and `version`. If no version is provided, resolves to the latest.
+### `checkLatestPackageDist(packageName: string): Promise<string>`
+Looks up the latest published version for a given package name (string only).
 
-### `isInstalled(pkg: PackageIdentifier): boolean`
-Returns `true` if the package is already in the local cache.
+---
+
+### `toPackageObject(packageId: string | PackageIdentifier): Promise<PackageIdentifier>`
+Parses `name`, `name@version`, or `name#version` into an object with `id` and `version`.  
+If no version is provided, resolves to the latest.
+
+---
+
+### `isInstalled(packageId: string | PackageIdentifier): Promise<boolean>`
+Returns `true` if the package is already present in the local cache.
+
+---
 
 ### `getCachePath(): string`
 Returns the root cache directory used by this installer.
 
+---
+
 ### `getLogger(): ILogger`
 Returns the logger instance used by this installer.
 
-### `getPackageDirPath(pkg: PackageIdentifier): string`
+---
+
+### `getPackageDirPath(packageId: string | PackageIdentifier): Promise<string>`
 Returns the path to a specific package folder in the cache.
 
 ---
