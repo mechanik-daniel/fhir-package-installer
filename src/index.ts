@@ -75,10 +75,11 @@ export class FhirPackageInstaller {
    * If the directory does not exist, it will be created.
    */
   private cachePath: string = path.join(os.homedir(), '.fhir', 'packages');
+  private skipExamples = false; // skip dependency installation of example packages
 
   
   constructor(config?: FpiConfig) {
-    const { logger, registryUrl, cachePath } = config || {} as FpiConfig;
+    const { logger, registryUrl, cachePath, skipExamples } = config || {} as FpiConfig;
     if (registryUrl) {
       this.registryUrl = registryUrl;
     }
@@ -87,6 +88,9 @@ export class FhirPackageInstaller {
     }
     if (logger) {
       this.logger = logger;
+    }
+    if (skipExamples) {
+      this.skipExamples = skipExamples;
     }
     if (!fs.existsSync(this.cachePath)) {
       fs.mkdirSync(this.cachePath, { recursive: true });
@@ -358,7 +362,12 @@ export class FhirPackageInstaller {
     await this.getPackageIndexFile(packageObject);
     const deps = await this.getDependencies(packageObject);
     for (const dep in deps) {
-      await this.install(`${dep}@${deps[dep]}`);
+      if (this.skipExamples && dep.includes('examples')) {
+        this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
+        continue;
+      } else {
+        await this.install(`${dep}@${deps[dep]}`);
+      }
     }
     return true;
   }

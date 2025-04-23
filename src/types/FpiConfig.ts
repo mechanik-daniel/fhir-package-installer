@@ -12,5 +12,6 @@ export interface FpiConfig {
     logger?: ILogger
     registryUrl?: string
     cachePath?: string
+    skipExamples?: boolean // skip dependency installation of example packages
   }
   
