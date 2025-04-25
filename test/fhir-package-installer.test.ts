@@ -3,13 +3,18 @@ import fs from 'fs-extra';
 import { describe, it, expect, beforeAll } from 'vitest';
 
 import fpi, { FhirPackageInstaller } from 'fhir-package-installer';
-import type { ILogger } from 'fhir-package-installer';
+import type { FileInPackageIndex, ILogger } from 'fhir-package-installer';
 
 const noopLogger: ILogger = {
   info: () => {},
   warn: () => {},
   error: () => {},
 };
+
+// Helper to sort index entries by 'filename'
+function sortIndexEntries(entries: FileInPackageIndex[]): FileInPackageIndex[] {
+  return entries.slice().sort((a, b) => a.filename.localeCompare(b.filename));
+}
 
 describe('fhir-package-installer module', () => {
   const fakePackage = { id: 'fake-package', version: '1.0.0' };
@@ -45,7 +50,6 @@ describe('fhir-package-installer module', () => {
     await expect(silentFpi.getPackageIndexFile(fakePackage))
       .rejects.toMatchObject({ code: 'ENOENT' });
   });
-  
 
   it('should return false for isInstalled on fake package', async () => {
     expect(await fpi.isInstalled(fakePackage)).toBe(false);
@@ -92,7 +96,7 @@ describe('fhir-package-installer module', () => {
     expect(manifest2.name).toBe(heavyPackage.id);
   });
 
-  it('should parse a package string to a valid package object', async () => {
+  it('should parse a package string to a valid PackageIdentifier object', async () => {
     const obj = await fpi.toPackageObject('pkg.name@1.0.0');
     expect(obj).toEqual({ id: 'pkg.name', version: '1.0.0' });
   });
@@ -117,5 +121,75 @@ describe('fhir-package-installer module', () => {
       'hl7.fhir.r4.core': true,
       'hl7.fhir.r4.examples': false
     });
+  });
+
+  it('should get correct index for hl7.fhir.r4.core package', async () => {
+    const generatedIndex = await customCacheFpi.getPackageIndexFile({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
+    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'hl7.fhir.r4.core-4.0.1.fpi.index.json'));
+
+    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
+
+    // Sort the 'files' array by 'filename' for stable comparison
+    const sortedGenerated = sortIndexEntries(generatedIndex.files);
+    const sortedReference = sortIndexEntries(referenceIndex.files);
+
+    // Deep compare the sorted arrays
+    expect(sortedGenerated).toEqual(sortedReference);
+  });
+
+  it('should get correct index for hl7.fhir.uv.sdc package', async () => {
+    const generatedIndex = await customCacheFpi.getPackageIndexFile({ id: 'hl7.fhir.uv.sdc', version: '3.0.0' });
+    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'hl7.fhir.uv.sdc#3.0.0.json'));
+
+    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
+
+    // Sort the 'files' array by 'filename' for stable comparison
+    const sortedGenerated = sortIndexEntries(generatedIndex.files);
+    const sortedReference = sortIndexEntries(referenceIndex.files);
+
+    // Deep compare the sorted arrays
+    expect(sortedGenerated).toEqual(sortedReference);
+  });
+
+  // us.nlm.vsac#0.11.0.json
+  it('should get correct index for us.nlm.vsac package', async () => {
+    const generatedIndex = await customCacheFpi.getPackageIndexFile({ id: 'us.nlm.vsac', version: '0.11.0' });
+    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'us.nlm.vsac#0.11.0.json'));
+
+    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
+
+    // Sort the 'files' array by 'filename' for stable comparison
+    const sortedGenerated = sortIndexEntries(generatedIndex.files);
+    const sortedReference = sortIndexEntries(referenceIndex.files);
+
+    // Deep compare the sorted arrays
+    expect(sortedGenerated).toEqual(sortedReference);
+  });
+
+  it('should correctly re-generate index for hl7.fhir.uv.sdc package', async () => {
+    const pkgDir = await customCacheFpi.getPackageDirPath('hl7.fhir.uv.sdc#3.0.0');
+    const indexToDelete = path.join(pkgDir, 'package', '.fpi.index.json');
+    expect(fs.existsSync(indexToDelete)).toBe(true);
+    fs.removeSync(indexToDelete);
+    expect(fs.existsSync(indexToDelete)).toBe(false);
+    const generatedIndex = await customCacheFpi.getPackageIndexFile('hl7.fhir.uv.sdc@3.0.0');
+    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'hl7.fhir.uv.sdc#3.0.0.json'));
+
+    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
+
+    // Sort the 'files' array by 'filename' for stable comparison
+    const sortedGenerated = sortIndexEntries(generatedIndex.files);
+    const sortedReference = sortIndexEntries(referenceIndex.files);
+
+    // Deep compare the sorted arrays
+    expect(sortedGenerated).toEqual(sortedReference);
+  });
+
+  it('should have correct content in the resources', () => {
+    const filename = 'ValueSet-1.3.6.1.4.1.6997.4.1.2.234.999.4.2.json';
+    const referenceVs = fs.readJSONSync(path.join(path.resolve('.'), 'test', filename));
+    const installedVs = fs.readJSONSync(path.join(customCachePath, 'us.nlm.vsac#0.11.0', 'package', filename));
+    expect(installedVs).toMatchObject(referenceVs);
+    expect(installedVs).toEqual(referenceVs);
   });
 });

@@ -10,9 +10,11 @@ import pLimit from 'p-limit';
 import path from 'path';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-import * as tar from 'tar';
+import * as tar from 'tar-stream';
+import * as zlib from 'zlib';
 import temp from 'temp';
 import os from 'os';
+import shallowParse from './shallowParse';
 
 import type {
   ILogger,
@@ -34,36 +36,35 @@ const defaultLogger: ILogger = {
 };
 
 /**
- * Max number of concurrent open files
+ * Max number of concurrent file operations (read / write))
  */
-const limit = pLimit(64);
+const limit = pLimit(Math.max(4, os.cpus().length));
 
-async function withRetries<T>(
-  fn: () => Promise<T>,
-  retries = 3,
-  delayMs = 5000
-): Promise<T> {
-  let lastError: any;
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      lastError = err;
-      const isTemporary =
-        err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND' || err.code === 'ECONNRESET';
-
-      if (!isTemporary || attempt === retries) {
-        throw err;
-      }
-
-      console.warn(
-        `⚠️ Attempt ${attempt} failed (${err.code || err.message}), retrying in ${delayMs}ms...`
-      );
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-  throw lastError;
-}
+/**
+ * Generates an index entry for the package resource
+ * @param filename resource filename
+ * @param content resource content
+ * @returns FileInPackageIndex object 
+ */
+const extractResourceIndexEntry = (filename: string, content: PackageResource): FileInPackageIndex => {
+  const evalAttribute = (att: any | any[]) => (typeof att === 'string' ? att : undefined);
+  const indexEntry: FileInPackageIndex = {
+    filename,
+    resourceType: content.resourceType,
+    id: content.id,
+    url: evalAttribute(content.url),
+    name: evalAttribute(content.name),
+    version: evalAttribute(content.version),
+    kind: evalAttribute(content.kind),
+    type: evalAttribute(content.type),
+    supplements: evalAttribute(content.supplements),
+    content: evalAttribute(content.content),
+    baseDefinition: evalAttribute(content.baseDefinition),
+    derivation: evalAttribute(content.derivation),
+    date: evalAttribute(content.date)
+  };
+  return indexEntry;
+};
 
 export class FhirPackageInstaller {
   private logger: ILogger = defaultLogger;
@@ -98,6 +99,33 @@ export class FhirPackageInstaller {
     }
   }
 
+  private async withRetries<T>(
+    fn: () => Promise<T>,
+    retries = 3,
+    delayMs = 5000
+  ): Promise<T> {
+    let lastError: any;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        lastError = err;
+        const isTemporary =
+          err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND' || err.code === 'ECONNRESET';
+  
+        if (!isTemporary || attempt === retries) {
+          throw err;
+        }
+  
+        this.logger.warn(
+          `⚠️ Attempt ${attempt} failed (${err.code || err.message}), retrying in ${delayMs}ms...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    throw lastError;
+  }
+
   /**
    * Takes a PackageIdentifier Object and returns the corresponding directory name of the package
    * @param packageObject A PackageObject with both name and version keys
@@ -126,6 +154,7 @@ export class FhirPackageInstaller {
     return path.join(await this.getPackageDirPath(packageId), 'package', '.fpi.index.json');
   }
 
+
   /**
    * Scans a package folder and generates a new `.fpi.index.json` file
    * @param packageObject The package identifier object
@@ -136,34 +165,20 @@ export class FhirPackageInstaller {
     this.logger.info(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
     const packagePath = await this.getPackageDirPath(pckIdObj);
     const indexPath = await this.getPackageIndexPath(pckIdObj);
-    const evalAttribute = (att: any | any[]) => (typeof att === 'string' ? att : undefined);
     try {
       const fileList = await fs.readdir(path.join(packagePath, 'package'));
       const files = await Promise.all(
         fileList.filter(
           file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
         ).map(
-          file =>
-            limit(async () => {
-              const content: PackageResource = await fs.readJSON(path.join(packagePath, 'package', file), { encoding: 'utf8' });
-              const indexEntry: FileInPackageIndex = {
-                filename: file,
-                resourceType: content.resourceType,
-                id: content.id,
-                url: evalAttribute(content.url),
-                name: evalAttribute(content.name),
-                version: evalAttribute(content.version),
-                kind: evalAttribute(content.kind),
-                type: evalAttribute(content.type),
-                supplements: evalAttribute(content.supplements),
-                content: evalAttribute(content.content),
-                baseDefinition: evalAttribute(content.baseDefinition),
-                derivation: evalAttribute(content.derivation),
-                date: evalAttribute(content.date)
-              };
+          file => limit(
+            async () => {
+              const content = shallowParse(await fs.readFile(path.join(packagePath, 'package', file), { encoding: 'utf8' }));
+              const indexEntry = extractResourceIndexEntry(file, content as PackageResource);
               return indexEntry;
             }
-            ))
+          )
+        )
       );
       const indexJson: PackageIndex = {
         'index-version': 2,
@@ -178,7 +193,7 @@ export class FhirPackageInstaller {
   }
 
   private fetchJson(url: string): Promise<any> {
-    return withRetries(() => new Promise((resolve, reject) => {
+    return this.withRetries(() => new Promise((resolve, reject) => {
       https.get(url, (res) => {
         let data = '';
         res.on('data', (chunk) => (data += chunk));
@@ -194,7 +209,7 @@ export class FhirPackageInstaller {
   }  
 
   private fetchStream(url: string): Promise<Readable> {
-    return withRetries(() => new Promise((resolve, reject) => {
+    return this.withRetries(() => new Promise((resolve, reject) => {
       https.get(url, (res) => {
         if (res.statusCode === 200) {
           resolve(res);
@@ -219,18 +234,77 @@ export class FhirPackageInstaller {
   }
 
   private async downloadTarball(packageObject: PackageIdentifier): Promise<string> {
+    const indexEntries: FileInPackageIndex[] = [];
+    const handleEntryPromises: Promise<void>[] = [];
+  
     const tarballUrl = await this.getTarballUrl(packageObject);
+    this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
     const tarballStream = await this.fetchStream(tarballUrl);
-    try {
-      temp.track();
-      const tempDirectory = temp.mkdirSync();
-      await pipeline(tarballStream, tar.x({ cwd: tempDirectory }));
-      this.logger.info(`Downloaded ${packageObject.id}@${packageObject.version} to a temporary directory`);
-      return tempDirectory;
-    } catch (e) {
-      this.logger.error(`Failed to extract tarball of package ${packageObject.id}@${packageObject.version}`);
-      throw e;
-    }
+    const tempDirectory = temp.mkdirSync();
+    temp.track();
+    this.logger.info(`Extracting ${packageObject.id}@${packageObject.version} to ${tempDirectory}`);
+    const extract = tar.extract();
+  
+    extract.on('entry', (header, stream, next) => {
+      const fullPath = path.join(tempDirectory, header.name);
+      const folderInTarball = path.dirname(header.name);
+      const fileName = path.basename(header.name);
+  
+      // Always ensure directory exists
+      fs.ensureDirSync(path.dirname(fullPath));
+  
+      // Push the write+index task into the limit-controlled queue:
+      const task = limit(async () => {
+        // Pipe to disk
+        await new Promise<void>((resolve, reject) => {
+          const fileWriteStream = fs.createWriteStream(fullPath);
+          stream.pipe(fileWriteStream);
+          stream.on('error', reject);
+          fileWriteStream.on('finish', resolve);
+          fileWriteStream.on('error', reject);
+        });
+  
+        // Collect metadata if applicable
+        if (
+          header.type === 'file' &&
+          folderInTarball === 'package' &&
+          fileName.endsWith('.json') &&
+          fileName !== 'package.json' &&
+          !fileName.endsWith('.index.json')
+        ) {
+          const contentBuffer = await fs.readFile(fullPath, 'utf8');
+          try {
+            const content = shallowParse(contentBuffer) as PackageResource;
+            const indexEntry = extractResourceIndexEntry(fileName, content);
+            indexEntries.push(indexEntry);
+          } catch (err) {
+            console.error(`Failed to parse ${fileName}:`, err);
+          }
+        }
+      });
+  
+      handleEntryPromises.push(task);
+  
+      // Immediately move on to next entry
+      next();
+    });
+  
+    await pipeline(
+      tarballStream,
+      zlib.createGunzip(),
+      extract
+    );
+  
+    await Promise.all(handleEntryPromises);
+  
+    const indexJson: PackageIndex = {
+      'index-version': 2,
+      files: indexEntries
+    };
+    await fs.writeJSON(path.join(tempDirectory, 'package', '.fpi.index.json'), indexJson);
+  
+    this.logger.info(`Extracted ${packageObject.id}@${packageObject.version} to a temporary directory`);
+    return tempDirectory;
   }
 
   private async cachePackageTarball(packageObject: PackageIdentifier, tempDirectory: string): Promise<string> {
