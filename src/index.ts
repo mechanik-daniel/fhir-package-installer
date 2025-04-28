@@ -311,8 +311,15 @@ export class FhirPackageInstaller {
     const finalPath = await this.getPackageDirPath(packageObject);
     const isInstalled = await this.isInstalled(packageObject);
     if (!isInstalled) {
-      await fs.move(tempDirectory, finalPath);
-      this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
+      // try to move the temp dir to the cache, this will fail if pkg was already installed by a parallel process
+      try {
+        await fs.move(tempDirectory, finalPath, { overwrite: false });
+        this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
+      }
+      catch {
+        this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
+        return finalPath;
+      }
     }
     return finalPath;
   }

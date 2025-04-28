@@ -39,7 +39,13 @@ export default function shallowParse(input) {
     i++; // skip opening quote
     while (i < len) {
       if (input[i] === '"') {
-        if (input[i - 1] !== '\\' || (input[i - 1] === '\\' && input[i - 2] === '\\')) break;
+        let backslashes = 0;
+        let j = i - 1;
+        while (j >= 0 && input[j] === '\\') {
+          backslashes++;
+          j--;
+        }
+        if (backslashes % 2 === 0) break; // even number of backslashes = not escaped
       }
       key += input[i++];
     }
@@ -54,17 +60,24 @@ export default function shallowParse(input) {
     // Parse value (only primitives allowed)
     let value;
     if (input[i] === '"') {
-      // String value
-      let str = '';
+      // String value: grab the raw quoted string including escapes
+      const start = i;
       i++; // skip opening quote
       while (i < len) {
         if (input[i] === '"') {
-          if (input[i - 1] !== '\\' || (input[i - 1] === '\\' && input[i - 2] === '\\')) break;
+          let backslashes = 0;
+          let j = i - 1;
+          while (j >= 0 && input[j] === '\\') {
+            backslashes++;
+            j--;
+          }
+          if (backslashes % 2 === 0) break; // even number of backslashes = not escaped
         }
-        str += input[i++];
+        i++;
       }
       i++; // skip closing quote
-      value = JSON.parse(`"${str}"`); // use JSON.parse for correct unescaping
+      const rawString = input.slice(start, i); // includes quotes
+      value = JSON.parse(rawString); // safely handles all escape sequences
     } else if (/[\d\-]/.test(input[i])) {
       // Number
       let numStr = '';
@@ -83,27 +96,39 @@ export default function shallowParse(input) {
       i += 4;
     } else {
       // Non-primitive (array/object/invalid) → skip this value entirely
-      // Use a simple stack counter to skip matching brackets/braces
       let stack = [];
       if (input[i] === '{' || input[i] === '[') {
         stack.push(input[i]);
         i++;
         while (i < len && stack.length > 0) {
-          if (input[i] === '"' && input[i - 1] !== '\\') {
-            // Skip string inside the object/array
+          if (input[i] === '"') {
+            // Skip string inside object/array
             i++;
             while (i < len) {
-              if (input[i] === '"' && input[i - 1] !== '\\') break;
+              if (input[i] === '"') {
+                let backslashes = 0;
+                let j = i - 1;
+                while (j >= 0 && input[j] === '\\') {
+                  backslashes++;
+                  j--;
+                }
+                if (backslashes % 2 === 0) break;
+              }
               i++;
             }
+            i++; // closing quote
           } else if (input[i] === '{' || input[i] === '[') {
             stack.push(input[i]);
+            i++;
           } else if (input[i] === '}' && stack[stack.length - 1] === '{') {
             stack.pop();
+            i++;
           } else if (input[i] === ']' && stack[stack.length - 1] === '[') {
             stack.pop();
+            i++;
+          } else {
+            i++;
           }
-          i++;
         }
       } else {
         // Unknown token, skip until next comma or closing brace
@@ -120,6 +145,7 @@ export default function shallowParse(input) {
     while (/\s/.test(input[i])) i++;
     if (input[i] === ',') i++;
   }
+  
   
   return result;
 }
