@@ -202,7 +202,7 @@ describe('fhir-package-installer module', () => {
 
   // Test downloadPackage function
   describe('downloadPackage', async () => {
-    it.only('download only - default path', async () => {
+    it('download only - default path', async () => {
       const downloadedPath = await fpi.downloadPackage(testPkg, { destination: downloadedPackagesPath });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
@@ -211,23 +211,23 @@ describe('fhir-package-installer module', () => {
     const customPath = path.join(downloadedPackagesPath, 'custom-path');
     const resolvedCustomPath = path.resolve(customPath);
 
-    it.only('download only - custom path - relative', async () => {
+    it('download only - custom path - relative', async () => {
       const downloadedPath = await fpi.downloadPackage(testPkg, { destination: customPath });
       expect(downloadedPath).toBe(path.join(resolvedCustomPath, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
-    it.only('download only - custom path - fail to override', async () => {
+    it('download only - custom path - fail to override', async () => {
       const action = fpi.downloadPackage(testPkg, { destination: customPath });
       await expect(action).rejects.toThrow('Failed to download package');
     });
 
-    it.only('download only - custom path - override', async () => {
+    it('download only - custom path - override', async () => {
       const action = fpi.downloadPackage(testPkg, { destination: customPath, overwrite: true });
       await expect(action).resolves.toBeDefined();
     });
     
-    it.only('download only - custom path - absolute', async () => {
+    it('download only - custom path - absolute', async () => {
       const tempDirectory = temp.mkdirSync();
       const downloadedPath = await fpi.downloadPackage(testPkg, { destination: tempDirectory });
       expect(downloadedPath).toBe(path.join(tempDirectory, `${testPkg.id}-${testPkg.version}.tgz`));
@@ -236,24 +236,24 @@ describe('fhir-package-installer module', () => {
       await fs.remove(tempDirectory);
     });
 
-    it.only('download and extract - default path', async () => {
+    it('download and extract - default path', async () => {
       const downloadedPath = await fpi.downloadPackage(testPkg, { destination: downloadedPackagesPath, extract: true });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}#${testPkg.version}`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
-    it.only('download and extract - custom path', async () => {
+    it('download and extract - custom path', async () => {
       const downloadedPath = await fpi.downloadPackage(testPkg, { destination: customPath, extract: true });
       expect(downloadedPath).toBe(path.join(resolvedCustomPath, `${testPkg.id}#${testPkg.version}`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
-    it.only('download and extract - custom path - fail to override', async () => {
+    it('download and extract - custom path - fail to override', async () => {
       const action = fpi.downloadPackage(testPkg, { destination: customPath, extract: true });
       await expect(action).rejects.toThrow('Failed to download package');
     });
 
-    it.only('download and extract - custom path - override', async () => {
+    it('download and extract - custom path - override', async () => {
       const action = fpi.downloadPackage(testPkg, { destination: customPath, extract: true, overwrite: true });
       await expect(action).resolves.toBeDefined();
     });
