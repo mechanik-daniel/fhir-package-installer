@@ -9,7 +9,7 @@ import fs from 'fs-extra';
 import pLimit from 'p-limit';
 import path from 'path';
 import { Readable } from 'stream';
-import { pipeline } from 'stream/promises';
+import { finished, pipeline } from 'stream/promises';
 import * as tar from 'tar-stream';
 import * as zlib from 'zlib';
 import temp from 'temp';
@@ -23,7 +23,8 @@ import type {
   PackageIdentifier,
   PackageIndex,
   PackageManifest,
-  PackageResource
+  PackageResource,
+  DownloadPackageOptions
 } from './types';
 
 /**
@@ -233,7 +234,23 @@ export class FhirPackageInstaller {
     }
   }
 
+  private async downloadFile(url: string, destination: string): Promise<void> {
+    const tarballStream = await this.fetchStream(url);
+    const fileStream = fs.createWriteStream(destination);
+    await finished(tarballStream.pipe(fileStream));
+  }
+
   private async downloadTarball(packageObject: PackageIdentifier): Promise<string> {
+    const tempDirectory = temp.mkdirSync();
+    const tarballPath = path.join(tempDirectory, `${packageObject.id}-${packageObject.version}.tgz`);
+    const tarballUrl = await this.getTarballUrl(packageObject);
+    
+    this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
+    await this.downloadFile(tarballUrl, tarballPath);
+    return tarballPath;
+  }
+
+  private async downloadAndExtractTarball(packageObject: PackageIdentifier): Promise<string> {
     const indexEntries: FileInPackageIndex[] = [];
     const handleEntryPromises: Promise<void>[] = [];
   
@@ -432,7 +449,7 @@ export class FhirPackageInstaller {
     const alreadyInstalled = await this.isInstalled(packageObject);
     if (!alreadyInstalled) {
       try {
-        const tempPath = await this.downloadTarball(packageObject);
+        const tempPath = await this.downloadAndExtractTarball(packageObject);
         await this.cachePackageTarball(packageObject, tempPath);
       } catch (e) {
         this.logger.error(e);
@@ -451,6 +468,54 @@ export class FhirPackageInstaller {
       }
     }
     return true;
+  }
+
+  /**
+   * Downloads a package tarball and optionally extracts it to a destination directory.
+   * 
+   * Behavior:
+   * - If `extract` is false or omitted: downloads the tarball as a .tgz file to the destination directory.
+   * - If `extract` is true: downloads and extracts the package into a subdirectory of the destination path.
+   *
+   * @param packageId A package identifier string or a PackageIdentifier object.
+   * @param options Options controlling the download and extraction behavior.
+   * @returns 
+   * - If `extract` is false: the full path to the downloaded tarball file.
+   * - If `extract` is true: the full path to the extracted package directory.
+   */
+  public async downloadPackage(
+    packageId: string | PackageIdentifier,
+    options?: DownloadPackageOptions): Promise<string> 
+  {
+    const { destination = '.', overwrite = false, extract = false } = options || {} as DownloadPackageOptions;
+
+    const packageObject = await this.toPackageObject(packageId);
+    const packageName = `${packageObject.id}@${packageObject.version}`;
+    
+    let finalPath = destination && path.isAbsolute(destination)
+      ? destination
+      : path.join(path.resolve(destination ||'.'));
+    if (extract) {
+      finalPath = path.join(finalPath, await this.toDirName(packageObject));
+    } else {
+      finalPath = path.join(finalPath, `${packageObject.id}-${packageObject.version}.tgz`);
+    }
+    this.logger.info(`Downloading ${(extract ? 'and extracting ' : '')}${packageName} to: ${finalPath}`);
+
+    try {
+      if (extract) {
+        const tempDirectory = await this.downloadAndExtractTarball(packageObject);
+        await fs.move(tempDirectory, finalPath, { overwrite });
+      } else {
+        const tempDirectory = await this.downloadTarball(packageObject);
+        await fs.move(tempDirectory, finalPath, { overwrite });
+      }
+      this.logger.info(`Downloaded ${packageName} to: ${finalPath}`);
+    } catch (e) {
+      this.logger.error(e);
+      throw new Error(`Failed to download package ${packageName}`);
+    }
+    return finalPath;
   }
 }
 
