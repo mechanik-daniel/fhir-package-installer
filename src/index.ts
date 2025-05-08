@@ -37,6 +37,17 @@ const defaultLogger: ILogger = {
 };
 
 /**
+ * Default prethrow function does nothing since the regular throw prints to console.log, which is the default logger
+ */
+const prethrow = (msg: Error | any): Error => {
+  if (msg instanceof Error) {
+    return msg;
+  }
+  const error = new Error(msg);
+  return error;
+};
+
+/**
  * Max number of concurrent file operations (read / write))
  */
 const limit = pLimit(Math.max(4, os.cpus().length));
@@ -78,7 +89,7 @@ export class FhirPackageInstaller {
    */
   private cachePath: string = path.join(os.homedir(), '.fhir', 'packages');
   private skipExamples = false; // skip dependency installation of example packages
-
+  private prethrow: (msg: Error | any) => Error = prethrow;
   
   constructor(config?: FpiConfig) {
     const { logger, registryUrl, cachePath, skipExamples } = config || {} as FpiConfig;
@@ -90,7 +101,15 @@ export class FhirPackageInstaller {
     }
     if (logger) {
       this.logger = logger;
-    }
+      this.prethrow = (msg: Error | any) => {
+        if (!(msg instanceof Error)) {
+          msg = new Error(msg);
+        }
+        this.logger.error(msg.message);
+        this.logger.error(JSON.stringify(msg, null, 2));
+        return msg;
+      };
+    };
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
@@ -143,7 +162,11 @@ export class FhirPackageInstaller {
    * @returns The full path to the package directory
    */
   public async getPackageDirPath(packageId: PackageIdentifier | string): Promise<string> {
-    return path.join(this.cachePath, await this.toDirName(packageId));
+    try {
+      return path.join(this.cachePath, await this.toDirName(packageId));
+    } catch (e) {
+      throw this.prethrow(e);
+    }
   }
 
   /**
@@ -356,59 +379,79 @@ export class FhirPackageInstaller {
   }
 
   public async isInstalled(packageId: PackageIdentifier | string): Promise<boolean> {
-    return await fs.exists(await this.getPackageDirPath(packageId));
+    try {
+      return await fs.exists(await this.getPackageDirPath(packageId));      
+    } catch (e) {
+      throw this.prethrow(e);
+    }
   }
 
   public async getPackageIndexFile(packageId: PackageIdentifier | string): Promise<PackageIndex> {
-    const indexPath = await this.getPackageIndexPath(packageId);
-    if (await fs.exists(indexPath)) {
-      return await fs.readJSON(indexPath, { encoding: 'utf8' });
+    try {
+      const indexPath = await this.getPackageIndexPath(packageId);
+      if (await fs.exists(indexPath)) {
+        return await fs.readJSON(indexPath, { encoding: 'utf8' });
+      }
+      return await this.generatePackageIndex(packageId);
+    } catch (e) {
+      throw this.prethrow(e);
     }
-    return await this.generatePackageIndex(packageId);
   }
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
-    const packageData = await this.getPackageDataFromRegistry(packageName);
-    return packageData['dist-tags']?.latest;
+    try {
+      const packageData = await this.getPackageDataFromRegistry(packageName);
+      return packageData['dist-tags']?.latest;
+    } catch (e) {
+      throw this.prethrow(e);
+    }
   }
 
   public async toPackageObject(packageId: string | PackageIdentifier): Promise<PackageIdentifier> {
-    let packageVersion: string;
-    let packageName: string;
-    if (typeof packageId === 'string') {
-      packageId = packageId.trim();
-      if (packageId.length === 0) {
-        this.logger.error('Invalid package identifier: empty string');
-        throw new Error('Invalid package identifier: empty string');
+    try {
+      let packageVersion: string;
+      let packageName: string;
+      if (typeof packageId === 'string') {
+        packageId = packageId.trim();
+        if (packageId.length === 0) {
+          this.logger.error('Invalid package identifier: empty string');
+          throw new Error('Invalid package identifier: empty string');
+        }
+        packageName = packageId.split('#')[0].split('@')[0];
+        packageVersion = this.getVersionFromPackageString(packageId);
+      } else {
+        packageName = packageId.id;
+        packageVersion = packageId.version || 'latest';
       }
-      packageName = packageId.split('#')[0].split('@')[0];
-      packageVersion = this.getVersionFromPackageString(packageId);
-    } else {
-      packageName = packageId.id;
-      packageVersion = packageId.version || 'latest';
-    }
-    if (packageVersion === 'latest') {
-      try {
-        packageVersion = await this.checkLatestPackageDist(packageName);
-      } catch (e) {
-        this.logger.error(`Failed to fetch latest version for package ${packageName}`);
-        throw e;
+      if (packageVersion === 'latest') {
+        try {
+          packageVersion = await this.checkLatestPackageDist(packageName);
+        } catch (e) {
+          this.logger.error(`Failed to fetch latest version for package ${packageName}`);
+          throw this.prethrow(e);
+        }
       }
+      return { id: packageName, version: packageVersion };
+    } catch (e) {
+      throw this.prethrow(e);
     }
-    return { id: packageName, version: packageVersion };
   }
 
   public async getManifest(packageId: string | PackageIdentifier): Promise<PackageManifest> {
-    if (typeof packageId === 'string') {
-      packageId = await this.toPackageObject(packageId);
-    }
-    const manifestPath = path.join(await this.getPackageDirPath(packageId), 'package', 'package.json');
-    const manifestFile = await fs.readJSON(manifestPath, { encoding: 'utf8' });
-    if (manifestFile) {
-      return manifestFile;
-    } else {
-      this.logger.warn(`Could not find package manifest for ${packageId.id}@${packageId.version}`);
-      return { name: packageId.id, version: packageId.version };
+    try {
+      if (typeof packageId === 'string') {
+        packageId = await this.toPackageObject(packageId);
+      }
+      const manifestPath = path.join(await this.getPackageDirPath(packageId), 'package', 'package.json');
+      const manifestFile = await fs.readJSON(manifestPath, { encoding: 'utf8' });
+      if (manifestFile) {
+        return manifestFile;
+      } else {
+        this.logger.warn(`Could not find package manifest for ${packageId.id}@${packageId.version}`);
+        return { name: packageId.id, version: packageId.version };
+      }
+    } catch (e) {
+      throw this.prethrow(e);
     }
   }
 
@@ -431,43 +474,51 @@ export class FhirPackageInstaller {
   }
 
   public async getDependencies(packageObject: PackageIdentifier) {
-    return (await this.getManifest(packageObject))?.dependencies;
+    try {
+      return (await this.getManifest(packageObject))?.dependencies;
+    } catch (e) {
+      throw this.prethrow(e);
+    }    
   }
 
   public async install(packageId: string | PackageIdentifier): Promise<boolean> {
-    let packageObject: PackageIdentifier;
-    if (typeof packageId === 'string') {
-      packageId = packageId.trim();
-      if (packageId.length === 0) {
-        this.logger.error('Invalid package identifier: empty string');
-        throw new Error('Invalid package identifier: empty string');
-      }
-      packageObject = await this.toPackageObject(packageId);
-    } else {
-      packageObject = packageId;
-    }
-    const alreadyInstalled = await this.isInstalled(packageObject);
-    if (!alreadyInstalled) {
-      try {
-        const tempPath = await this.downloadAndExtractTarball(packageObject);
-        await this.cachePackageTarball(packageObject, tempPath);
-      } catch (e) {
-        this.logger.error(e);
-        throw new Error(`Failed to install package ${packageObject.id}@${packageObject.version}`);
-      }
-    }
-
-    await this.getPackageIndexFile(packageObject);
-    const deps = await this.getDependencies(packageObject);
-    for (const dep in deps) {
-      if (this.skipExamples && dep.includes('examples')) {
-        this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
-        continue;
+    try {
+      let packageObject: PackageIdentifier;
+      if (typeof packageId === 'string') {
+        packageId = packageId.trim();
+        if (packageId.length === 0) {
+          this.logger.error('Invalid package identifier: empty string');
+          throw new Error('Invalid package identifier: empty string');
+        }
+        packageObject = await this.toPackageObject(packageId);
       } else {
-        await this.install(`${dep}@${deps[dep]}`);
+        packageObject = packageId;
       }
+      const alreadyInstalled = await this.isInstalled(packageObject);
+      if (!alreadyInstalled) {
+        try {
+          const tempPath = await this.downloadAndExtractTarball(packageObject);
+          await this.cachePackageTarball(packageObject, tempPath);
+        } catch (e) {
+          this.logger.error(`Failed to install package ${packageObject.id}@${packageObject.version}`);
+          throw this.prethrow(e);
+        }
+      }
+  
+      await this.getPackageIndexFile(packageObject);
+      const deps = await this.getDependencies(packageObject);
+      for (const dep in deps) {
+        if (this.skipExamples && dep.includes('examples')) {
+          this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
+          continue;
+        } else {
+          await this.install(`${dep}@${deps[dep]}`);
+        }
+      }
+      return true;
+    } catch (e) {
+      throw this.prethrow(e);
     }
-    return true;
   }
 
   /**
@@ -487,35 +538,40 @@ export class FhirPackageInstaller {
     packageId: string | PackageIdentifier,
     options?: DownloadPackageOptions): Promise<string> 
   {
-    const { destination = '.', overwrite = false, extract = false } = options || {} as DownloadPackageOptions;
-
-    const packageObject = await this.toPackageObject(packageId);
-    const packageName = `${packageObject.id}@${packageObject.version}`;
-    
-    let finalPath = destination && path.isAbsolute(destination)
-      ? destination
-      : path.join(path.resolve(destination ||'.'));
-    if (extract) {
-      finalPath = path.join(finalPath, await this.toDirName(packageObject));
-    } else {
-      finalPath = path.join(finalPath, `${packageObject.id}-${packageObject.version}.tgz`);
-    }
-    this.logger.info(`Downloading ${(extract ? 'and extracting ' : '')}${packageName} to: ${finalPath}`);
-
     try {
+      const { destination = '.', overwrite = false, extract = false } = options || {} as DownloadPackageOptions;
+
+      const packageObject = await this.toPackageObject(packageId);
+      const packageName = `${packageObject.id}@${packageObject.version}`;
+      
+      let finalPath = destination && path.isAbsolute(destination)
+        ? destination
+        : path.join(path.resolve(destination ||'.'));
       if (extract) {
-        const tempDirectory = await this.downloadAndExtractTarball(packageObject);
-        await fs.move(tempDirectory, finalPath, { overwrite });
+        finalPath = path.join(finalPath, await this.toDirName(packageObject));
       } else {
-        const tempDirectory = await this.downloadTarball(packageObject);
-        await fs.move(tempDirectory, finalPath, { overwrite });
+        finalPath = path.join(finalPath, `${packageObject.id}-${packageObject.version}.tgz`);
       }
-      this.logger.info(`Downloaded ${packageName} to: ${finalPath}`);
-    } catch (e) {
-      this.logger.error(e);
-      throw new Error(`Failed to download package ${packageName}`);
+      this.logger.info(`Downloading ${(extract ? 'and extracting ' : '')}${packageName} to: ${finalPath}`);
+  
+      try {
+        if (extract) {
+          const tempDirectory = await this.downloadAndExtractTarball(packageObject);
+          await fs.move(tempDirectory, finalPath, { overwrite });
+        } else {
+          const tempDirectory = await this.downloadTarball(packageObject);
+          await fs.move(tempDirectory, finalPath, { overwrite });
+        }
+        this.logger.info(`Downloaded ${packageName} to: ${finalPath}`);
+      } catch (e) {
+        this.logger.error(`Failed to download package ${packageName}`);
+        throw this.prethrow(e);
+      }
+      return finalPath;
     }
-    return finalPath;
+    catch (e) {
+      throw this.prethrow(e);
+    }
   }
 }
 
