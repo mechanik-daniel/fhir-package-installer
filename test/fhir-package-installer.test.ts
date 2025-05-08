@@ -219,7 +219,7 @@ describe('fhir-package-installer module', () => {
 
     it('download only - custom path - fail to override', async () => {
       const action = fpi.downloadPackage(testPkg, { destination: customPath });
-      await expect(action).rejects.toThrow('Failed to download package');
+      await expect(action).rejects.toThrow('dest already exists.');
     });
 
     it('download only - custom path - override', async () => {
@@ -250,7 +250,7 @@ describe('fhir-package-installer module', () => {
 
     it('download and extract - custom path - fail to override', async () => {
       const action = fpi.downloadPackage(testPkg, { destination: customPath, extract: true });
-      await expect(action).rejects.toThrow('Failed to download package');
+      await expect(action).rejects.toThrow('dest already exists.');
     });
 
     it('download and extract - custom path - override', async () => {
