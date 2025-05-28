@@ -525,7 +525,12 @@ export class FhirPackageInstaller {
 
   public async getDependencies(packageObject: PackageIdentifier) {
     try {
-      return (await this.getManifest(packageObject))?.dependencies;
+      const deps = (await this.getManifest(packageObject))?.dependencies;
+      // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
+      if (deps && deps['hl7.fhir.r4.core'] === '4.0.0') {
+        deps['hl7.fhir.r4.core'] = '4.0.1';
+      }
+      return deps || {};
     } catch (e) {
       throw this.prethrow(e);
     }    
@@ -567,10 +572,6 @@ export class FhirPackageInstaller {
     const deps = await this.getDependencies(packageObject);
     
     for (const dep in deps) {
-      // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
-      if (dep === 'hl7.fhir.r4.core' && deps[dep] === '4.0.0') {
-        deps[dep] = '4.0.1';
-      }
       if (this.skipExamples && dep.includes('examples')) {
         this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
         continue;
