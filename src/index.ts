@@ -236,15 +236,20 @@ export class FhirPackageInstaller {
   }  
 
   private fetchStream(url: string): Promise<Readable> {
-    return this.withRetries(() => new Promise((resolve, reject) => {
-      https.get(url, (res) => {
-        if (res.statusCode === 200) {
-          resolve(res);
-        } else {
-          reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
-        }
-      }).on('error', reject);
-    }));
+    try {
+      return this.withRetries(() => new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+          if (res.statusCode === 200) {
+            resolve(res);
+          } else {
+            reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
+          }
+        }).on('error', reject);
+      }));      
+    } catch (e) {
+      this.logger.error(`Failed to fetch stream from ${url}`);
+      throw e;
+    }
   }  
 
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
@@ -252,18 +257,28 @@ export class FhirPackageInstaller {
   }
 
   private async getTarballUrl(packageObject: PackageIdentifier): Promise<string> {
+    let url: string;
     try {
       const packageData = await this.getPackageDataFromRegistry(packageObject.id);
-      return packageData.versions[packageObject.version]?.dist?.tarball;
+      url = packageData.versions[packageObject.version]?.dist?.tarball ?? packageData.versions[packageObject.version]?.url;
     } catch {
+      throw new Error(`Package ${packageObject.id}@${packageObject.version} not found in the registry at ${this.registryUrl}.`);
+    }      
+    if (!url) {
       return `${this.fallbackUrlBase}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
     }
+    return url;
   }
 
   private async downloadFile(url: string, destination: string): Promise<void> {
-    const tarballStream = await this.fetchStream(url);
-    const fileStream = fs.createWriteStream(destination);
-    await finished(tarballStream.pipe(fileStream));
+    try {
+      const tarballStream = await this.fetchStream(url);
+      const fileStream = fs.createWriteStream(destination);
+      await finished(tarballStream.pipe(fileStream));
+    } catch (e) {
+      this.logger.error(`Failed to download file from ${url}`);
+      throw e;
+    }
   }
 
   private async downloadTarball(packageObject: PackageIdentifier): Promise<string> {
@@ -272,7 +287,12 @@ export class FhirPackageInstaller {
     const tarballUrl = await this.getTarballUrl(packageObject);
     
     this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
-    await this.downloadFile(tarballUrl, tarballPath);
+    try {
+      await this.downloadFile(tarballUrl, tarballPath);
+    } catch (e) {
+      this.logger.error(`Failed to download package ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
+      throw e;
+    }
     return tarballPath;
   }
 
@@ -545,7 +565,12 @@ export class FhirPackageInstaller {
   private async installPackageDependencies(packageObject: PackageIdentifier): Promise<void>{
     await this.getPackageIndexFile(packageObject);
     const deps = await this.getDependencies(packageObject);
+    
     for (const dep in deps) {
+      // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
+      if (dep === 'hl7.fhir.r4.core' && deps[dep] === '4.0.0') {
+        deps[dep] = '4.0.1';
+      }
       if (this.skipExamples && dep.includes('examples')) {
         this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
         continue;
