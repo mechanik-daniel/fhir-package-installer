@@ -565,7 +565,12 @@ export class FhirPackageInstaller {
   private async installPackageDependencies(packageObject: PackageIdentifier): Promise<void>{
     await this.getPackageIndexFile(packageObject);
     const deps = await this.getDependencies(packageObject);
+    
     for (const dep in deps) {
+      // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
+      if (dep === 'hl7.fhir.r4.core' && deps[dep] === '4.0.0') {
+        deps[dep] = '4.0.1';
+      }
       if (this.skipExamples && dep.includes('examples')) {
         this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
         continue;
