@@ -573,7 +573,6 @@ export class FhirPackageInstaller {
     
     for (const dep in deps) {
       if (this.skipExamples && dep.includes('examples')) {
-        this.logger.info(`Skipping example package ${dep}@${deps[dep]}`);
         continue;
       } else {
         await this.install(`${dep}@${deps[dep]}`);
