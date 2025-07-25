@@ -296,15 +296,19 @@ export class FhirPackageInstaller {
               const errorData = JSON.parse(data);
               const errorMsg = errorData.error || errorData.message || data;
               
-              // Convert authentication/authorization errors to "not found" for consistency
-              if (res.statusCode === 403 || res.statusCode === 401) {
-                reject(new Error('Package not found in the registry (authentication failed)'));
+              // Handle authentication/authorization errors separately
+              if (res.statusCode === 403) {
+                reject(new Error('Authorization failed: Access to the package is forbidden (HTTP 403).'));
+              } else if (res.statusCode === 401) {
+                reject(new Error('Authentication failed: Invalid or missing credentials (HTTP 401).'));
               } else {
                 reject(new Error(`HTTP ${res.statusCode}: ${errorMsg}`));
               }
             } catch {
-              if (res.statusCode === 403 || res.statusCode === 401) {
-                reject(new Error('Package not found in the registry (authentication failed)'));
+              if (res.statusCode === 403) {
+                reject(new Error('Authorization failed: Access to the package is forbidden (HTTP 403).'));
+              } else if (res.statusCode === 401) {
+                reject(new Error('Authentication failed: Invalid or missing credentials (HTTP 401).'));
               } else {
                 reject(new Error(`HTTP ${res.statusCode}: ${data || 'Unknown error'}`));
               }
