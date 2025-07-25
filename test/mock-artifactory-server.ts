@@ -129,7 +129,8 @@ export class MockArtifactoryServer {
       
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(modifiedResponse));
-    } catch {
+    } catch (error) {
+      console.error('Error handling Artifactory request:', error);
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Package not found' }));
     }
