@@ -5,6 +5,7 @@
  */
 
 import https from 'https';
+import http from 'http';
 import fs from 'fs-extra';
 import pLimit from 'p-limit';
 import path from 'path';
@@ -84,6 +85,7 @@ const extractResourceIndexEntry = (filename: string, content: PackageResource): 
 export class FhirPackageInstaller {
   private logger: ILogger = defaultLogger;
   private registryUrl = 'https://packages.fhir.org';
+  private registryToken?: string; // optional token for private registries
   private fallbackUrlBase = 'https://packages.simplifier.net';
   /**
    * Path to the FHIR package cache directory.
@@ -92,15 +94,22 @@ export class FhirPackageInstaller {
    */
   private cachePath: string = path.join(os.homedir(), '.fhir', 'packages');
   private skipExamples = false; // skip dependency installation of example packages
+  private allowHttp = false; // allow HTTP URLs for testing
   private prethrow: (msg: Error | any) => Error = prethrow;
   
   constructor(config?: FpiConfig) {
-    const { logger, registryUrl, cachePath, skipExamples } = config || {} as FpiConfig;
+    const { logger, registryUrl, registryToken, cachePath, skipExamples, allowHttp } = config || {} as FpiConfig;
     if (registryUrl) {
       this.registryUrl = registryUrl;
     }
+    if (registryToken) {
+      this.registryToken = registryToken;
+    }
     if (cachePath) {
       this.cachePath = cachePath;
+    }
+    if (allowHttp) {
+      this.allowHttp = allowHttp;
     }
     if (logger) {
       this.logger = logger;
@@ -219,12 +228,90 @@ export class FhirPackageInstaller {
     }
   }
 
-  private fetchJson(url: string): Promise<any> {
+  /**
+   * Generates HTTP options including authorization header for registry requests
+   * @param url The URL being requested
+   * @returns HTTP options object with headers if needed
+   */
+  private getHttpOptions(url: string): https.RequestOptions {
+    const options: https.RequestOptions = {};
+    
+    // Add authorization header for requests to the configured registry
+    // or any URL that contains the same hostname (to handle redirects within the same registry)
+    if (this.registryToken) {
+      const registryHostname = new URL(this.registryUrl).hostname;
+      const urlHostname = new URL(url).hostname;
+      
+      if (url.startsWith(this.registryUrl) || urlHostname === registryHostname) {
+        options.headers = {
+          'Authorization': `Bearer ${this.registryToken}`
+        };
+      }
+    }
+    
+    return options;
+  }
+
+  private fetchJson(url: string, redirectCount = 0): Promise<any> {
+    const maxRedirects = 5;
+    
     return this.withRetries(() => new Promise((resolve, reject) => {
-      https.get(url, (res) => {
+      const options = this.getHttpOptions(url);
+      const isHttps = url.startsWith('https:');
+      const isHttp = url.startsWith('http:');
+      
+      // Check if HTTP is allowed for testing
+      if (isHttp && !this.allowHttp) {
+        reject(new Error('HTTP URLs not allowed. Use HTTPS or enable allowHttp for testing.'));
+        return;
+      }
+      
+      const client = isHttps ? https : http;
+      client.get(url, options, (res) => {
+        // Handle redirects (301, 302, 303, 307, 308)
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          if (redirectCount >= maxRedirects) {
+            reject(new Error(`Too many redirects (${maxRedirects}) when fetching ${url}`));
+            return;
+          }
+          
+          const redirectTarget = res.headers.location;
+          const displayUrl = redirectTarget.length > 64 
+            ? `${redirectTarget.substring(0, 64)}...` 
+            : redirectTarget;
+          this.logger.info(`Following redirect from ${url} to ${displayUrl}`);
+          // Recursively follow the redirect
+          this.fetchJson(res.headers.location, redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+        
         let data = '';
         res.on('data', (chunk) => (data += chunk));
         res.on('end', () => {
+          // Check for HTTP error status codes
+          if (res.statusCode && res.statusCode >= 400) {
+            try {
+              const errorData = JSON.parse(data);
+              const errorMsg = errorData.error || errorData.message || data;
+              
+              // Convert authentication/authorization errors to "not found" for consistency
+              if (res.statusCode === 403 || res.statusCode === 401) {
+                reject(new Error('Package not found in the registry (authentication failed)'));
+              } else {
+                reject(new Error(`HTTP ${res.statusCode}: ${errorMsg}`));
+              }
+            } catch {
+              if (res.statusCode === 403 || res.statusCode === 401) {
+                reject(new Error('Package not found in the registry (authentication failed)'));
+              } else {
+                reject(new Error(`HTTP ${res.statusCode}: ${data || 'Unknown error'}`));
+              }
+            }
+            return;
+          }
+          
           try {
             resolve(JSON.parse(data));
           } catch (e) {
@@ -235,10 +322,42 @@ export class FhirPackageInstaller {
     }));
   }  
 
-  private fetchStream(url: string): Promise<Readable> {
+  private fetchStream(url: string, redirectCount = 0): Promise<Readable> {
+    const maxRedirects = 5;
+    
     try {
       return this.withRetries(() => new Promise((resolve, reject) => {
-        https.get(url, (res) => {
+        const options = this.getHttpOptions(url);
+        const isHttps = url.startsWith('https:');
+        const isHttp = url.startsWith('http:');
+        
+        // Check if HTTP is allowed for testing
+        if (isHttp && !this.allowHttp) {
+          reject(new Error('HTTP URLs not allowed. Use HTTPS or enable allowHttp for testing.'));
+          return;
+        }
+        
+        const client = isHttps ? https : http;
+        client.get(url, options, (res) => {
+          // Handle redirects (301, 302, 303, 307, 308)
+          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            if (redirectCount >= maxRedirects) {
+              reject(new Error(`Too many redirects (${maxRedirects}) when fetching ${url}`));
+              return;
+            }
+            
+            const redirectTarget = res.headers.location;
+            const displayUrl = redirectTarget.length > 64 
+              ? `${redirectTarget.substring(0, 64)}...` 
+              : redirectTarget;
+            this.logger.info(`Following redirect from ${url} to ${displayUrl}`);
+            // Recursively follow the redirect
+            this.fetchStream(res.headers.location, redirectCount + 1)
+              .then(resolve)
+              .catch(reject);
+            return;
+          }
+          
           if (res.statusCode === 200) {
             resolve(res);
           } else {
@@ -257,13 +376,28 @@ export class FhirPackageInstaller {
   }
 
   private async getTarballUrl(packageObject: PackageIdentifier): Promise<string> {
-    let url: string;
+    const isPrivateRegistry = this.registryUrl !== 'https://packages.fhir.org';
+    
+    // Always fetch package metadata for validation and version information
+    let packageData: Record<string, any>;
     try {
-      const packageData = await this.getPackageDataFromRegistry(packageObject.id);
-      url = packageData.versions[packageObject.version]?.dist?.tarball ?? packageData.versions[packageObject.version]?.url;
+      packageData = await this.getPackageDataFromRegistry(packageObject.id);
     } catch {
+      throw new Error(`Package ${packageObject.id} not found in the registry at ${this.registryUrl}.`);
+    }
+    
+    // Validate that the specific version exists
+    if (!packageData.versions?.[packageObject.version]) {
       throw new Error(`Package ${packageObject.id}@${packageObject.version} not found in the registry at ${this.registryUrl}.`);
-    }      
+    }
+    
+    // For private registries, construct the URL using the registry base (don't trust provided tarball URLs)
+    if (isPrivateRegistry) {
+      return `${this.registryUrl}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
+    }
+    
+    // For the default registry, try to get the tarball URL from package metadata
+    const url = packageData.versions[packageObject.version]?.dist?.tarball ?? packageData.versions[packageObject.version]?.url;
     if (!url) {
       return `${this.fallbackUrlBase}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
     }
@@ -447,7 +581,11 @@ export class FhirPackageInstaller {
   public async checkLatestPackageDist(packageName: string): Promise<string> {
     try {
       const packageData = await this.getPackageDataFromRegistry(packageName);
-      return packageData['dist-tags']?.latest;
+      const latest = packageData['dist-tags']?.latest;
+      if (!latest) {
+        throw new Error(`Package ${packageName} not found or has no latest version tag`);
+      }
+      return latest;
     } catch (e) {
       throw this.prethrow(e);
     }
