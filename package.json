@@ -1,10 +1,18 @@
 {
   "name": "fhir-package-installer",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "A utility module for downloading, indexing, caching, and managing FHIR packages from the FHIR Package Registry and Simplifier",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
   "author": "Outburn Ltd.",
   "license": "MIT",
   "keywords": [
@@ -29,12 +37,11 @@
     "url": "git+https://github.com/Outburn-IL/fhir-package-installer.git"
   },
   "scripts": {
-    "clean:build": "rimraf dist",
-    "build:ncc": "ncc build src/index.ts --external fs-extra --external tar-stream --external temp --no-cache --out dist",
-    "build": "npm run clean:build && npm run build:ncc",
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsup",
     "dist-to-module": "rimraf node_modules/fhir-package-installer && npm run build && node test/dist-to-module.js",
     "check-registries": "node test/checkRegistriesAvailable.js",
-    "pretest": "npm run dist-to-module && npm run check-registries",
+    "pretest": "npm run dist-to-module && npm run check-registries && node test/cjs-test.cjs && node test/esm-test.mjs",
     "test": "vitest run",
     "test:dual-mode": "vitest run test/fhir-package-installer.dual-mode.test.ts",
     "test:mock-server": "vitest run test/mock-artifactory-server.test.ts",
@@ -51,13 +58,13 @@
     "@types/fs-extra": "^11.0.4",
     "@types/tar-stream": "^3.1.4",
     "@types/temp": "^0.9.4",
-    "@vercel/ncc": "^0.38.3",
     "eslint": "^9.32.0",
     "globals": "^16.3.0",
     "rimraf": "^6.0.1",
     "tslib": "^2.8.1",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "tsup": "^8.0.1"
   }
 }
