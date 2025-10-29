@@ -1,6 +1,6 @@
 {
   "name": "fhir-package-installer",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "A utility module for downloading, indexing, caching, and managing FHIR packages from the FHIR Package Registry and Simplifier",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
