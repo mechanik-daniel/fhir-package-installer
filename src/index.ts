@@ -125,10 +125,6 @@ export class FhirPackageInstaller {
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
-    if (!fs.existsSync(this.cachePath)) {
-      fs.mkdirSync(this.cachePath, { recursive: true });
-      this.logger.info(`Directory '${this.cachePath}' created successfully.`);
-    }
   }
 
   private async withRetries<T>(
