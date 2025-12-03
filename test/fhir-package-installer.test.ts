@@ -3,7 +3,7 @@ import temp from 'temp';
 import fs from 'fs-extra';
 import { describe, it, expect, beforeAll } from 'vitest';
 
-import fpi, { FhirPackageInstaller } from 'fhir-package-installer';
+import { FhirPackageInstaller, MemoryLatestVersionCache } from 'fhir-package-installer';
 import type { FileInPackageIndex, ILogger } from 'fhir-package-installer';
 
 const noopLogger: ILogger = {
@@ -34,11 +34,23 @@ describe('fhir-package-installer module', () => {
   
   const heavyPackage = { id: 'us.nlm.vsac', version: '0.11.0' };
 
-  const silentFpi = new FhirPackageInstaller({ logger: noopLogger });
+  // Create a shared FHIR package latest version cache to prevent multiple registry calls during tests
+  const sharedCache = new MemoryLatestVersionCache();
+  
+  const silentFpi = new FhirPackageInstaller({ 
+    logger: noopLogger,
+    latestVersionCache: sharedCache
+  });
   const customCachePath = path.join(path.resolve('.'), 'test', '.test-cache');
   const customCacheFpi = new FhirPackageInstaller({
     cachePath: customCachePath,
-    skipExamples: true
+    skipExamples: true,
+    latestVersionCache: sharedCache
+  });
+
+  // Create a test instance that also uses shared cache for default cache path tests
+  const testFpi = new FhirPackageInstaller({
+    latestVersionCache: sharedCache
   });
 
   const downloadedPackagesPath = path.join('.', 'test', 'downloaded-packages');
@@ -52,8 +64,8 @@ describe('fhir-package-installer module', () => {
   }, 20000);
 
   it('should return correct fake package directory path (default cache)', async () => {
-    const expectedPath = path.join(fpi.getCachePath(), 'fake-package#1.0.0');
-    expect(await fpi.getPackageDirPath(fakePackage)).toBe(expectedPath);
+    const expectedPath = path.join(testFpi.getCachePath(), 'fake-package#1.0.0');
+    expect(await testFpi.getPackageDirPath(fakePackage)).toBe(expectedPath);
   });
 
   it('should return correct package directory path (custom cache)', async () => {
@@ -67,7 +79,7 @@ describe('fhir-package-installer module', () => {
   });
 
   it('should return false for isInstalled on fake package', async () => {
-    expect(await fpi.isInstalled(fakePackage)).toBe(false);
+    expect(await testFpi.isInstalled(fakePackage)).toBe(false);
   });
 
   it('should return false for isInstalled on deleted real package', async () => {
@@ -77,7 +89,7 @@ describe('fhir-package-installer module', () => {
   });
 
   it('should correctly detect latest available version of test package', async () => {
-    const latest = await fpi.checkLatestPackageDist(testPkg.id);
+    const latest = await testFpi.checkLatestPackageDist(testPkg.id);
     expect(latest).toBe(testPkg.version);
   });
 
@@ -114,7 +126,7 @@ describe('fhir-package-installer module', () => {
   });
 
   it('should parse a package string to a valid PackageIdentifier object', async () => {
-    const obj = await fpi.toPackageObject('pkg.name@1.0.0');
+    const obj = await testFpi.toPackageObject('pkg.name@1.0.0');
     expect(obj).toEqual({ id: 'pkg.name', version: '1.0.0' });
   });
 
@@ -213,7 +225,7 @@ describe('fhir-package-installer module', () => {
   // Test downloadPackage function
   describe('downloadPackage', async () => {
     it('download only - default path', async () => {
-      const downloadedPath = await fpi.downloadPackage(testPkg, { destination: downloadedPackagesPath });
+      const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: downloadedPackagesPath });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
@@ -222,24 +234,24 @@ describe('fhir-package-installer module', () => {
     const resolvedCustomPath = path.resolve(customPath);
 
     it('download only - custom path - relative', async () => {
-      const downloadedPath = await fpi.downloadPackage(testPkg, { destination: customPath });
+      const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: customPath });
       expect(downloadedPath).toBe(path.join(resolvedCustomPath, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
     it('download only - custom path - fail to override', async () => {
-      const action = fpi.downloadPackage(testPkg, { destination: customPath });
+      const action = testFpi.downloadPackage(testPkg, { destination: customPath });
       await expect(action).rejects.toThrow('dest already exists.');
     });
 
     it('download only - custom path - override', async () => {
-      const action = fpi.downloadPackage(testPkg, { destination: customPath, overwrite: true });
+      const action = testFpi.downloadPackage(testPkg, { destination: customPath, overwrite: true });
       await expect(action).resolves.toBeDefined();
     });
     
     it('download only - custom path - absolute', async () => {
       const tempDirectory = temp.mkdirSync();
-      const downloadedPath = await fpi.downloadPackage(testPkg, { destination: tempDirectory });
+      const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: tempDirectory });
       expect(downloadedPath).toBe(path.join(tempDirectory, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
       // Clean up
@@ -247,24 +259,24 @@ describe('fhir-package-installer module', () => {
     });
 
     it('download and extract - default path', async () => {
-      const downloadedPath = await fpi.downloadPackage(testPkg, { destination: downloadedPackagesPath, extract: true });
+      const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: downloadedPackagesPath, extract: true });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}#${testPkg.version}`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
     it('download and extract - custom path', async () => {
-      const downloadedPath = await fpi.downloadPackage(testPkg, { destination: customPath, extract: true });
+      const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: customPath, extract: true });
       expect(downloadedPath).toBe(path.join(resolvedCustomPath, `${testPkg.id}#${testPkg.version}`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
     it('download and extract - custom path - fail to override', async () => {
-      const action = fpi.downloadPackage(testPkg, { destination: customPath, extract: true });
+      const action = testFpi.downloadPackage(testPkg, { destination: customPath, extract: true });
       await expect(action).rejects.toThrow('dest already exists.');
     });
 
     it('download and extract - custom path - override', async () => {
-      const action = fpi.downloadPackage(testPkg, { destination: customPath, extract: true, overwrite: true });
+      const action = testFpi.downloadPackage(testPkg, { destination: customPath, extract: true, overwrite: true });
       await expect(action).resolves.toBeDefined();
     });
 
