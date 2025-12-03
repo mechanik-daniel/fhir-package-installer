@@ -26,8 +26,10 @@ import type {
   PackageManifest,
   PackageResource,
   DownloadPackageOptions,
-  InstallPackageOptions
+  InstallPackageOptions,
+  ILatestVersionCache
 } from './types';
+import { MemoryLatestVersionCache } from './types';
 
 temp.track();
 
@@ -96,9 +98,10 @@ export class FhirPackageInstaller {
   private skipExamples = false; // skip dependency installation of example packages
   private allowHttp = false; // allow HTTP URLs for testing
   private prethrow: (msg: Error | any) => Error = prethrow;
+  private latestVersionCache: ILatestVersionCache;
   
   constructor(config?: FpiConfig) {
-    const { logger, registryUrl, registryToken, cachePath, skipExamples, allowHttp } = config || {} as FpiConfig;
+    const { logger, registryUrl, registryToken, cachePath, skipExamples, allowHttp, latestVersionCache } = config || {} as FpiConfig;
     if (registryUrl) {
       this.registryUrl = registryUrl;
     }
@@ -125,6 +128,9 @@ export class FhirPackageInstaller {
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
+    
+    // Initialize latest version cache (use provided one or create new default)
+    this.latestVersionCache = latestVersionCache || new MemoryLatestVersionCache();
   }
 
   private async withRetries<T>(
@@ -576,11 +582,23 @@ export class FhirPackageInstaller {
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
     try {
+      // Check cache first
+      const cachedVersion = this.latestVersionCache.get(packageName);
+      if (cachedVersion) {
+        this.logger.info(`Using cached latest version for FHIR package ${packageName}: ${cachedVersion}`);
+        return cachedVersion;
+      }
+
+      // Cache miss, fetch from registry
+      this.logger.info(`Fetching latest version for FHIR package ${packageName} from registry`);
       const packageData = await this.getPackageDataFromRegistry(packageName);
       const latest = packageData['dist-tags']?.latest;
       if (!latest) {
         throw new Error(`Package ${packageName} not found or has no latest version tag`);
       }
+      
+      // Store in cache
+      this.latestVersionCache.set(packageName, latest);
       return latest;
     } catch (e) {
       throw this.prethrow(e);
@@ -845,5 +863,8 @@ export type {
   PackageResource,
   DownloadPackageOptions,
   InstallPackageOptions,
-  FpiConfig
+  FpiConfig,
+  ILatestVersionCache
 } from './types';
+
+export { MemoryLatestVersionCache } from './types';

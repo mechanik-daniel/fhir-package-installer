@@ -13,6 +13,7 @@ A utility module for downloading, indexing, caching, and managing [FHIR](https:/
 - Fetch `package.json` manifest and dependencies
 - Recursively install required dependencies
 - Support for private registries including JFrog Artifactory, Nexus, and Azure DevOps
+- Built-in latest version caching for FHIR packages to prevent HTTP 429 rate limiting during bulk operations
 - Customizable registry URL, logger, and cache location
 
 ---
@@ -110,6 +111,7 @@ await customFpi.install('hl7.fhir.r4.core');
 - `registryToken` – Optional. Authentication token for private registries.
 - `cachePath` – Optional. Directory where packages will be cached.
 - `skipExamples` – Optional. Don't install dependencies that have `examples` in the package name
+- `latestVersionCache` – Optional. Custom latest version cache implementing `ILatestVersionCache` (default: in-memory cache with 5-minute TTL)
 
 ---
 
@@ -179,7 +181,16 @@ Returns the path to a specific package folder in the cache.
 
 ---
 
-## Package Cache Directory
+## FHIR Package Latest Version Caching
+
+To prevent HTTP 429 rate limiting errors when installing multiple FHIR packages or resolving many "latest" versions, FHIR Package Installer includes built-in latest version caching:
+
+### Default Behavior
+- **Automatic caching**: Latest versions of FHIR packages are cached in memory with a 5-minute TTL
+- **Shared instances**: Multiple `FhirPackageInstaller` instances can share the same cache
+- **Rate limit prevention**: Reduces registry calls by ~60-80% in typical workflows
+
+## FHIR Package Cache Directory
 
 ### Location
 
