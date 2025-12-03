@@ -286,7 +286,7 @@ describe('fhir-package-installer module', () => {
   describe('install local package', () => {
     beforeAll(async () => {
       await fs.remove(customCachePath);
-    });
+    }, TIMEOUT);
 
     it('should fail when src is empty', async () => {
       const action = customCacheFpi.installLocalPackage('');
