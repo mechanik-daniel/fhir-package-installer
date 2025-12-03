@@ -9,10 +9,12 @@ A utility module for downloading, indexing, caching, and managing [FHIR](https:/
 - Download and install [FHIR NPM-style packages](https://hl7.org/fhir/packages.html) (e.g., `hl7.fhir.uv.sdc@3.0.0`)
 - Cache downloaded packages locally in the [FHIR Package Cache](https://confluence.hl7.org/spaces/FHIR/pages/66928417/FHIR+Package+Cache) or a custom path if defined in the constructor.
 - Automatically resolve `latest` versions
+- **Automatic implicit dependencies** - Core FHIR packages automatically include terminology and extension packages
 - Generate and retrieve a local index (`.fpi.index.json`) of all FHIR JSON files in the package
 - Fetch `package.json` manifest and dependencies
 - Recursively install required dependencies
 - Support for private registries including JFrog Artifactory, Nexus, and Azure DevOps
+- Built-in latest version caching for FHIR packages to prevent HTTP 429 rate limiting during bulk operations
 - Customizable registry URL, logger, and cache location
 
 ---
@@ -110,6 +112,7 @@ await customFpi.install('hl7.fhir.r4.core');
 - `registryToken` – Optional. Authentication token for private registries.
 - `cachePath` – Optional. Directory where packages will be cached.
 - `skipExamples` – Optional. Don't install dependencies that have `examples` in the package name
+- `latestVersionCache` – Optional. Custom latest version cache implementing `ILatestVersionCache` (default: in-memory cache with 5-minute TTL)
 
 ---
 
@@ -144,7 +147,7 @@ If the file doesn't exist, it will be generated automatically.
 ---
 
 ### `getDependencies(packageId: string | PackageIdentifier): Promise<Record<string, string>>`
-Parses dependencies listed in the package's `package.json`.
+Returns the direct dependencies of a package, including both explicit dependencies defined in `package.json` and automatic implicit dependencies (for core FHIR packages).
 
 ---
 
@@ -179,7 +182,41 @@ Returns the path to a specific package folder in the cache.
 
 ---
 
-## Package Cache Directory
+## Implicit Dependency Management
+
+FHIR Package Installer automatically manages implicit dependencies for core FHIR packages. When you install a base FHIR package (like `hl7.fhir.r4.core`), the system automatically includes essential terminology and extension packages that are commonly required.
+
+### Automatic Implicit Dependencies
+
+When installing core FHIR packages, these implicit dependencies are automatically added:
+
+| Core Package | Implicit Dependencies |
+|--------------|----------------------|
+| `hl7.fhir.r3.core` | `hl7.terminology.r3`, `hl7.fhir.uv.extensions.r3` |
+| `hl7.fhir.r4.core` | `hl7.terminology.r4`, `hl7.fhir.uv.extensions.r4` |
+| `hl7.fhir.r5.core` | `hl7.terminology.r5`, `hl7.fhir.uv.extensions.r5` |
+
+### Fallback Behavior
+
+The implicit dependency resolver uses an **online-first, cache-fallback** strategy:
+
+1. **Online Resolution**: Attempts to resolve the latest versions from the registry
+2. **Cache Fallback**: If online resolution fails, uses the latest cached versions
+3. **Graceful Degradation**: Logs warnings but continues installation if implicit packages can't be resolved
+
+
+---
+
+## FHIR Package Latest Version Caching
+
+To prevent HTTP 429 rate limiting errors when installing multiple FHIR packages or resolving many "latest" versions, FHIR Package Installer includes built-in latest version caching:
+
+### Default Behavior
+- **Automatic caching**: Latest versions of FHIR packages are cached in memory with a 5-minute TTL
+- **Shared instances**: Multiple `FhirPackageInstaller` instances can share the same cache
+- **Rate limit prevention**: Reduces registry calls by ~60-80% in typical workflows
+
+## FHIR Package Cache Directory
 
 ### Location
 

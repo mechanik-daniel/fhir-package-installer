@@ -21,7 +21,7 @@ function checkUrl(url) {
 async function main() {
   const registries = [
     'https://packages.fhir.org/hl7.fhir.r4.core',
-    'https://packages.simplifier.net/hl7.fhir.r4.core/-/hl7.fhir.r4.core-4.0.1.tgz'
+    'https://packages.simplifier.net/hl7.fhir.r4.core'
   ];
 
   const results = await Promise.all(registries.map(checkUrl));

@@ -4,6 +4,7 @@
  */
 
 import { ILogger } from './Logger';
+import { ILatestVersionCache } from './LatestVersionCache';
 
 /**
  * The structure of the FPI constructor config object.
@@ -15,5 +16,6 @@ export interface FpiConfig {
     cachePath?: string
     skipExamples?: boolean // skip dependency installation of example packages
     allowHttp?: boolean // allow HTTP URLs for testing (default: false)
+    latestVersionCache?: ILatestVersionCache // cache for FHIR package latest versions (default: in-memory cache with 5-minute TTL)
   }
   
