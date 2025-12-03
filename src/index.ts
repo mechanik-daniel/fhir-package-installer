@@ -15,6 +15,7 @@ import * as tar from 'tar-stream';
 import * as zlib from 'zlib';
 import temp from 'temp';
 import os from 'os';
+import semver from 'semver';
 import shallowParse from './shallowParse';
 
 import type {
@@ -32,6 +33,25 @@ import type {
 import { MemoryLatestVersionCache } from './types';
 
 temp.track();
+
+/**
+ * Mapping from core FHIR packages to their implicit dependencies
+ * Based on https://chat.fhir.org/#narrow/stream/179239-tooling/topic/New.20Implicit.20Package/near/325318949
+ */
+const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
+  'hl7.fhir.r3.core': [
+    'hl7.terminology.r3', 
+    'hl7.fhir.uv.extensions.r3'
+  ],
+  'hl7.fhir.r4.core': [
+    'hl7.terminology.r4',
+    'hl7.fhir.uv.extensions.r4'
+  ],
+  'hl7.fhir.r5.core': [
+    'hl7.terminology.r5',
+    'hl7.fhir.uv.extensions.r5'
+  ]
+};
 
 /**
  * default logger uses global console methods
@@ -99,6 +119,8 @@ export class FhirPackageInstaller {
   private allowHttp = false; // allow HTTP URLs for testing
   private prethrow: (msg: Error | any) => Error = prethrow;
   private latestVersionCache: ILatestVersionCache;
+  private resolvingImplicitDeps = new Set<string>();
+  private installingPackages = new Set<string>();
   
   constructor(config?: FpiConfig) {
     const { logger, registryUrl, registryToken, cachePath, skipExamples, allowHttp, latestVersionCache } = config || {} as FpiConfig;
@@ -675,17 +697,148 @@ export class FhirPackageInstaller {
     return this.logger;
   }
 
-  public async getDependencies(packageObject: PackageIdentifier) {
+  /**
+   * Scan cache directory for installed versions of a package
+   * @param packageName Package name to search for
+   * @returns Array of installed versions sorted in descending order (latest first)
+   */
+  private async getInstalledVersions(packageName: string): Promise<string[]> {
     try {
-      const deps = (await this.getManifest(packageObject))?.dependencies;
+      const cacheDirs = await fs.readdir(this.cachePath);
+      const versions: string[] = [];
+      
+      for (const dirName of cacheDirs) {
+        if (dirName.startsWith(`${packageName}#`)) {
+          const version = dirName.substring(packageName.length + 1);
+          versions.push(version);
+        }
+      }
+      
+      // Sort versions in descending order (latest first) using semver
+      return versions.sort((a, b) => semver.rcompare(a, b));
+    } catch (e) {
+      this.logger.warn(`Failed to scan cache for package ${packageName}: ${e}`);
+      return [];
+    }
+  }
+
+  /**
+   * Resolve the latest version for an implicit package dependency
+   * Tries online registry first, then falls back to latest cached version
+   * @param packageName The implicit package name
+   * @returns Resolved version or throws if no version found
+   */
+  private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
+    // First try to get the latest version from registry (using existing cache)
+    try {
+      const latest = await this.checkLatestPackageDist(packageName);
+      this.logger.info(`Resolved implicit package ${packageName} to latest version: ${latest}`);
+      return latest;
+    } catch (onlineError: any) {
+      this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
+      
+      // Fallback to latest cached version
+      const installedVersions = await this.getInstalledVersions(packageName);
+      if (installedVersions.length === 0) {
+        throw new Error(`No version of implicit package ${packageName} found in cache. Cannot determine version to use.`);
+      }
+      
+      const latestCached = installedVersions[0]; // Already sorted with latest first
+      this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
+      
+      // Update the cache with this fallback version so other operations can reuse it
+      this.latestVersionCache.set(packageName, latestCached);
+      
+      return latestCached;
+    }
+  }
+
+  /**
+   * Get implicit dependencies for a given package
+   * @param packageObject The package to check for implicit dependencies
+   * @returns Promise resolving to record of implicit dependencies
+   */
+  private async getImplicitDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+    const implicitDeps: Record<string, string> = {};
+    
+    // Prevent recursion - if we're already resolving implicit deps for this package, return empty
+    const packageKey = `${packageObject.id}@${packageObject.version}`;
+    if (this.resolvingImplicitDeps.has(packageKey)) {
+      return implicitDeps;
+    }
+    
+    // Check if this package triggers implicit dependencies
+    const implicitPackageIds = IMPLICIT_DEPENDENCIES_MAP[packageObject.id];
+    if (!implicitPackageIds || implicitPackageIds.length === 0) {
+      return implicitDeps;
+    }
+    
+    // Mark this package as being resolved to prevent recursion
+    this.resolvingImplicitDeps.add(packageKey);
+    
+    try {
+      this.logger.info(`Package ${packageObject.id} requires implicit dependencies: ${implicitPackageIds.join(', ')}`);
+      
+      // Resolve versions for each implicit dependency
+      for (const implicitPackageId of implicitPackageIds) {
+        try {
+          const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
+          implicitDeps[implicitPackageId] = version;
+          this.logger.info(`Added implicit dependency: ${implicitPackageId}@${version}`);
+        } catch (e: any) {
+          this.logger.warn(`Failed to resolve implicit dependency ${implicitPackageId}: ${e?.message || e}`);
+          // Continue with other implicit dependencies rather than failing completely
+        }
+      }
+    } finally {
+      // Always remove from tracking set
+      this.resolvingImplicitDeps.delete(packageKey);
+    }
+    
+    return implicitDeps;
+  }
+
+  /**
+   * Get explicit dependencies from package.json only (internal use)
+   * @param packageObject The package to get explicit dependencies for
+   * @returns Promise resolving to record of explicit dependencies only
+   */
+  private async getExplicitDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+    try {
+      const deps = (await this.getManifest(packageObject))?.dependencies || {};
       // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
       if (deps && deps['hl7.fhir.r4.core'] === '4.0.0') {
         deps['hl7.fhir.r4.core'] = '4.0.1';
       }
-      return deps || {};
+      return deps;
     } catch (e) {
       throw this.prethrow(e);
     }    
+  }
+
+  /**
+   * Get all dependencies for a package, including both explicit dependencies from package.json 
+   * and automatic implicit dependencies for core FHIR packages.
+   * 
+   * For core FHIR packages (hl7.fhir.r3.core, hl7.fhir.r4.core, hl7.fhir.r5.core), 
+   * this automatically includes essential terminology and extension packages.
+   * 
+   * @param packageObject The package to get dependencies for
+   * @returns Promise resolving to record of all dependencies (explicit + implicit)
+   */
+  public async getDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+    try {
+      // Get explicit dependencies from package.json
+      const explicitDeps = await this.getExplicitDependencies(packageObject);
+      
+      // Get implicit dependencies if this is a core package  
+      const implicitDeps = await this.getImplicitDependencies(packageObject);
+      
+      // Merge dependencies, with explicit taking precedence over implicit
+      return { ...implicitDeps, ...explicitDeps };
+    } catch (e) {
+      throw this.prethrow(e);
+    }
   }
 
   public async install(packageId: string | PackageIdentifier): Promise<boolean> {
@@ -701,6 +854,14 @@ export class FhirPackageInstaller {
       } else {
         packageObject = packageId;
       }
+      
+      // Prevent circular installations
+      const packageKey = `${packageObject.id}@${packageObject.version}`;
+      if (this.installingPackages.has(packageKey)) {
+        this.logger.info(`Skipping installation of ${packageKey} - already in progress`);
+        return true;
+      }
+      
       const alreadyInstalled = await this.isInstalled(packageObject);
       if (!alreadyInstalled) {
         try {
@@ -711,9 +872,16 @@ export class FhirPackageInstaller {
           throw this.prethrow(e);
         }
       }
-  
-      await this.installPackageDependencies(packageObject);
-      return true;
+      
+      // Mark as installing before dependency installation
+      this.installingPackages.add(packageKey);
+      try {
+        await this.installPackageDependencies(packageObject);
+        return true;
+      } finally {
+        // Always remove from installing set
+        this.installingPackages.delete(packageKey);
+      }
     } catch (e) {
       throw this.prethrow(e);
     }
@@ -721,13 +889,15 @@ export class FhirPackageInstaller {
 
   private async installPackageDependencies(packageObject: PackageIdentifier): Promise<void>{
     await this.getPackageIndexFile(packageObject);
-    const deps = await this.getDependencies(packageObject);
     
-    for (const dep in deps) {
+    // Get all dependencies (explicit + implicit) using the updated getDependencies method
+    const allDeps = await this.getDependencies(packageObject);
+    
+    for (const dep in allDeps) {
       if (this.skipExamples && dep.includes('examples')) {
         continue;
       } else {
-        await this.install(`${dep}@${deps[dep]}`);
+        await this.install(`${dep}@${allDeps[dep]}`);
       }
     }
   }

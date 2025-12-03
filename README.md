@@ -9,6 +9,7 @@ A utility module for downloading, indexing, caching, and managing [FHIR](https:/
 - Download and install [FHIR NPM-style packages](https://hl7.org/fhir/packages.html) (e.g., `hl7.fhir.uv.sdc@3.0.0`)
 - Cache downloaded packages locally in the [FHIR Package Cache](https://confluence.hl7.org/spaces/FHIR/pages/66928417/FHIR+Package+Cache) or a custom path if defined in the constructor.
 - Automatically resolve `latest` versions
+- **Automatic implicit dependencies** - Core FHIR packages automatically include terminology and extension packages
 - Generate and retrieve a local index (`.fpi.index.json`) of all FHIR JSON files in the package
 - Fetch `package.json` manifest and dependencies
 - Recursively install required dependencies
@@ -146,7 +147,7 @@ If the file doesn't exist, it will be generated automatically.
 ---
 
 ### `getDependencies(packageId: string | PackageIdentifier): Promise<Record<string, string>>`
-Parses dependencies listed in the package's `package.json`.
+Returns the direct dependencies of a package, including both explicit dependencies defined in `package.json` and automatic implicit dependencies (for core FHIR packages).
 
 ---
 
@@ -178,6 +179,31 @@ Returns the logger instance used by this installer.
 
 ### `getPackageDirPath(packageId: string | PackageIdentifier): Promise<string>`
 Returns the path to a specific package folder in the cache.
+
+---
+
+## Implicit Dependency Management
+
+FHIR Package Installer automatically manages implicit dependencies for core FHIR packages. When you install a base FHIR package (like `hl7.fhir.r4.core`), the system automatically includes essential terminology and extension packages that are commonly required.
+
+### Automatic Implicit Dependencies
+
+When installing core FHIR packages, these implicit dependencies are automatically added:
+
+| Core Package | Implicit Dependencies |
+|--------------|----------------------|
+| `hl7.fhir.r3.core` | `hl7.terminology.r3`, `hl7.fhir.uv.extensions.r3` |
+| `hl7.fhir.r4.core` | `hl7.terminology.r4`, `hl7.fhir.uv.extensions.r4` |
+| `hl7.fhir.r5.core` | `hl7.terminology.r5`, `hl7.fhir.uv.extensions.r5` |
+
+### Fallback Behavior
+
+The implicit dependency resolver uses an **online-first, cache-fallback** strategy:
+
+1. **Online Resolution**: Attempts to resolve the latest versions from the registry
+2. **Cache Fallback**: If online resolution fails, uses the latest cached versions
+3. **Graceful Degradation**: Logs warnings but continues installation if implicit packages can't be resolved
+
 
 ---
 
