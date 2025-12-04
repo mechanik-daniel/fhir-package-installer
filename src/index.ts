@@ -607,7 +607,6 @@ export class FhirPackageInstaller {
       // Check cache first
       const cachedVersion = this.latestVersionCache.get(packageName);
       if (cachedVersion) {
-        this.logger.info(`Using cached latest version for FHIR package ${packageName}: ${cachedVersion}`);
         return cachedVersion;
       }
 
@@ -732,7 +731,6 @@ export class FhirPackageInstaller {
     // First try to get the latest version from registry (using existing cache)
     try {
       const latest = await this.checkLatestPackageDist(packageName);
-      this.logger.info(`Resolved implicit package ${packageName} to latest version: ${latest}`);
       return latest;
     } catch (onlineError: any) {
       this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
@@ -777,14 +775,12 @@ export class FhirPackageInstaller {
     this.resolvingImplicitDeps.add(packageKey);
     
     try {
-      this.logger.info(`Package ${packageObject.id} requires implicit dependencies: ${implicitPackageIds.join(', ')}`);
       
       // Resolve versions for each implicit dependency
       for (const implicitPackageId of implicitPackageIds) {
         try {
           const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
           implicitDeps[implicitPackageId] = version;
-          this.logger.info(`Added implicit dependency: ${implicitPackageId}@${version}`);
         } catch (e: any) {
           this.logger.warn(`Failed to resolve implicit dependency ${implicitPackageId}: ${e?.message || e}`);
           // Continue with other implicit dependencies rather than failing completely
@@ -858,7 +854,6 @@ export class FhirPackageInstaller {
       // Prevent circular installations
       const packageKey = `${packageObject.id}@${packageObject.version}`;
       if (this.installingPackages.has(packageKey)) {
-        this.logger.info(`Skipping installation of ${packageKey} - already in progress`);
         return true;
       }
       

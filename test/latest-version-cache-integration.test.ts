@@ -109,7 +109,7 @@ describe('FHIR Package Latest Version Caching', () => {
       const version2 = await fpi.checkLatestPackageDist(packageName);
       expect(version2).toBe('3.0.0');
       expect(mockFetchJson).toHaveBeenCalledTimes(1); // Still only 1 call
-      expect(mockLogger.info).toHaveBeenCalledWith(`Using cached latest version for FHIR package ${packageName}: 3.0.0`);
+      // No additional logging expected for cache hits (reduced logging)
       
       // Restore original method
       fpiInternal.fetchJson = originalFetchJson;
