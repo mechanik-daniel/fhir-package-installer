@@ -3,7 +3,7 @@
  *   Project name: FHIR-Package-Installer
  */
 
-import { PackageIdentifier } from './PackageIdentifier';
+import { PackageIdentifier } from './index';
 
 /**
  * Options for installing a package.

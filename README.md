@@ -107,7 +107,7 @@ await customFpi.install('hl7.fhir.r4.core');
 ```
 
 ### `FpiConfig` fields:
-- `logger` – Optional. Custom logger implementing the `ILogger` interface.
+- `logger` – Optional. Custom logger implementing the `ILogger` interface (from `@outburn/types`).
 - `registryUrl` – Optional. Custom package registry base URL (e.g., JFrog Artifactory).
 - `registryToken` – Optional. Authentication token for private registries.
 - `cachePath` – Optional. Directory where packages will be cached.
@@ -120,7 +120,7 @@ await customFpi.install('hl7.fhir.r4.core');
 
 ### `install(packageId: string | PackageIdentifier): Promise<boolean>`
 Downloads and installs a package and all its dependencies.  
-Accepts either a package identifier object (`{ id, version }`) or a string (`'name@version'`, `'name#version'`, or `'name'`).
+Accepts either a package identifier object (`{ id, version }` from `@outburn/types`) or a string (`'name@version'`, `'name#version'`, or `'name'`).
 
 ---
 

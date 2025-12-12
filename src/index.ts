@@ -411,7 +411,7 @@ export class FhirPackageInstaller {
     }
     
     // Validate that the specific version exists
-    if (!packageData.versions?.[packageObject.version]) {
+    if (!packageObject.version || !packageData.versions?.[packageObject.version]) {
       throw new Error(`Package ${packageObject.id}@${packageObject.version} not found in the registry at ${this.registryUrl}.`);
     }
     
@@ -421,7 +421,7 @@ export class FhirPackageInstaller {
     }
     
     // For the default registry, try to get the tarball URL from package metadata
-    const url = packageData.versions[packageObject.version]?.dist?.tarball ?? packageData.versions[packageObject.version]?.url;
+    const url = packageData.versions[packageObject.version!]?.dist?.tarball ?? packageData.versions[packageObject.version!]?.url;
     if (!url) {
       return `${this.fallbackUrlBase}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
     }
@@ -671,7 +671,7 @@ export class FhirPackageInstaller {
         return manifestFile;
       } else {
         this.logger.warn(`Could not find package manifest for ${packageId.id}@${packageId.version}`);
-        return { name: packageId.id, version: packageId.version };
+        return { name: packageId.id, version: packageId.version || 'unknown' };
       }
     } catch (e) {
       throw this.prethrow(e);

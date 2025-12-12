@@ -3,7 +3,7 @@
  *   Project name: FHIR-Package-Installer
  */
 
-import { ILogger } from './Logger';
+import { ILogger } from './index';
 import { ILatestVersionCache } from './LatestVersionCache';
 
 /**
