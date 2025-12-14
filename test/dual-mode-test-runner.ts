@@ -1,9 +1,9 @@
 import { FhirPackageInstaller } from 'fhir-package-installer';
-import type { ILogger } from 'fhir-package-installer';
+import type { Logger } from '@outburn/types';
 import { MockArtifactoryServer } from './mock-artifactory-server.js';
 
 interface FpiConfig {
-  logger?: ILogger;
+  logger?: Logger;
   registryUrl?: string;
   registryToken?: string;
   cachePath?: string;
@@ -48,7 +48,7 @@ export class DualModeTestRunner {
    */
   static createTestContexts(
     baseConfig: Partial<FpiConfig> = {},
-    logger?: ILogger
+    logger?: Logger
   ): TestContext[] {
     const directContext: TestContext = {
       fpi: new FhirPackageInstaller({
@@ -79,7 +79,7 @@ export class DualModeTestRunner {
   static async runInBothModes<T>(
     testFn: (context: TestContext) => Promise<T>,
     baseConfig: Partial<FpiConfig> = {},
-    logger?: ILogger
+    logger?: Logger
   ): Promise<{ direct: T; artifactory: T }> {
     const contexts = this.createTestContexts(baseConfig, logger);
     
@@ -107,7 +107,7 @@ export function createDualModeTests(
   testName: string,
   testFn: (context: TestContext) => Promise<void>,
   baseConfig: Partial<FpiConfig> = {},
-  logger?: ILogger,
+  logger?: Logger,
   options: { timeout?: number; skip?: boolean } = {}
 ) {
   const contexts = DualModeTestRunner.createTestContexts(baseConfig, logger);

@@ -19,10 +19,8 @@ import semver from 'semver';
 import shallowParse from './shallowParse';
 
 import type {
-  ILogger,
   FpiConfig,
   FileInPackageIndex,
-  PackageIdentifier,
   PackageIndex,
   PackageManifest,
   PackageResource,
@@ -31,6 +29,7 @@ import type {
   ILatestVersionCache
 } from './types';
 import { MemoryLatestVersionCache } from './types';
+import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
 temp.track();
 
@@ -56,7 +55,7 @@ const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
 /**
  * default logger uses global console methods
  */
-const defaultLogger: ILogger = {
+const defaultLogger: Logger = {
   info: (msg: any) => console.log(msg),
   warn: (msg: any) => console.warn(msg),
   error: (msg: any) => console.error(msg)
@@ -105,7 +104,7 @@ const extractResourceIndexEntry = (filename: string, content: PackageResource): 
 };
 
 export class FhirPackageInstaller {
-  private logger: ILogger = defaultLogger;
+  private logger: Logger = defaultLogger;
   private registryUrl = 'https://packages.fhir.org';
   private registryToken?: string; // optional token for private registries
   private fallbackUrlBase = 'https://packages.simplifier.net';
@@ -183,21 +182,21 @@ export class FhirPackageInstaller {
   }
 
   /**
-   * Takes a PackageIdentifier Object and returns the corresponding directory name of the package
+   * Takes a FhirPackageIdentifier Object and returns the corresponding directory name of the package
    * @param packageObject A PackageObject with both name and version keys
    * @returns (string) Directory name in the standard format `name#version`
    */
-  private async toDirName(packageId: PackageIdentifier | string): Promise<string> {
-    packageId = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
-    return packageId.id + '#' + packageId.version;
+  private async toDirName(packageId: FhirPackageIdentifier | string): Promise<string> {
+    const packageObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    return packageObj.id + '#' + packageObj.version;
   }
 
   /**
-   * Takes a PackageIdentifier Object and returns the path to the package folder in the cache
-   * @param packageObject A PackageIdentifier Object with both name and version keys
+   * Takes a FhirPackageIdentifier Object and returns the path to the package folder in the cache
+   * @param packageObject A FhirPackageIdentifier Object with both name and version keys
    * @returns The full path to the package directory
    */
-  public async getPackageDirPath(packageId: PackageIdentifier | string): Promise<string> {
+  public async getPackageDirPath(packageId: FhirPackageIdentifier | string): Promise<string> {
     try {
       return path.join(this.cachePath, await this.toDirName(packageId));
     } catch (e) {
@@ -207,10 +206,10 @@ export class FhirPackageInstaller {
 
   /**
    * Get the full path to the .fpi.index.json file in the package folder
-   * @param packageObject A PackageIdentifier Object with both name and version keys
+   * @param packageObject A FhirPackageIdentifier Object with both name and version keys
    * @returns (string) The path to the package index file
    */
-  private async getPackageIndexPath(packageId: PackageIdentifier | string): Promise<string> {
+  private async getPackageIndexPath(packageId: FhirPackageIdentifier | string): Promise<string> {
     return path.join(await this.getPackageDirPath(packageId), 'package', '.fpi.index.json');
   }
 
@@ -220,7 +219,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package identifier object
    * @returns PackageIndex
    */
-  private async generatePackageIndex(packageId: PackageIdentifier | string): Promise<PackageIndex> {
+  private async generatePackageIndex(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
     const pckIdObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
     this.logger.info(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
     const packagePath = await this.getPackageDirPath(pckIdObj);
@@ -399,7 +398,7 @@ export class FhirPackageInstaller {
     return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
   }
 
-  private async getTarballUrl(packageObject: PackageIdentifier): Promise<string> {
+  private async getTarballUrl(packageObject: FhirPackageIdentifier): Promise<string> {
     const isPrivateRegistry = this.registryUrl !== 'https://packages.fhir.org';
     
     // Always fetch package metadata for validation and version information
@@ -439,7 +438,7 @@ export class FhirPackageInstaller {
     }
   }
 
-  private async downloadTarball(packageObject: PackageIdentifier): Promise<string> {
+  private async downloadTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const tempDirectory = temp.mkdirSync();
     const tarballPath = path.join(tempDirectory, `${packageObject.id}-${packageObject.version}.tgz`);
     const tarballUrl = await this.getTarballUrl(packageObject);
@@ -532,7 +531,7 @@ export class FhirPackageInstaller {
     return tempDirectory;
   }
 
-  private async downloadAndExtractTarball(packageObject: PackageIdentifier): Promise<string> {
+  private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const tarballUrl = await this.getTarballUrl(packageObject);
     this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
     const tarballStream = await this.fetchStream(tarballUrl);
@@ -547,7 +546,7 @@ export class FhirPackageInstaller {
    * @param move Whether to move the package to the cache or copy it. Defaults to **true**.
    * @returns The path to the cached package directory
    */
-  private async cachePackage(packageObject: PackageIdentifier, src: string, move: boolean = true): Promise<string> {
+  private async cachePackage(packageObject: FhirPackageIdentifier, src: string, move: boolean = true): Promise<string> {
     let finalPath = await this.getPackageDirPath(packageObject);
     if (!await fs.exists(path.join(src, 'package'))) {
       finalPath = path.join(finalPath, 'package');
@@ -582,7 +581,7 @@ export class FhirPackageInstaller {
     return 'latest';
   }
 
-  public async isInstalled(packageId: PackageIdentifier | string): Promise<boolean> {
+  public async isInstalled(packageId: FhirPackageIdentifier | string): Promise<boolean> {
     try {
       return await fs.exists(await this.getPackageDirPath(packageId));      
     } catch (e) {
@@ -590,7 +589,7 @@ export class FhirPackageInstaller {
     }
   }
 
-  public async getPackageIndexFile(packageId: PackageIdentifier | string): Promise<PackageIndex> {
+  public async getPackageIndexFile(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
     try {
       const indexPath = await this.getPackageIndexPath(packageId);
       if (await fs.exists(indexPath)) {
@@ -626,18 +625,18 @@ export class FhirPackageInstaller {
     }
   }
 
-  public async toPackageObject(packageId: string | PackageIdentifier): Promise<PackageIdentifier> {
+  public async toPackageObject(packageId: string | FhirPackageIdentifier): Promise<FhirPackageIdentifier> {
     try {
       let packageVersion: string;
       let packageName: string;
       if (typeof packageId === 'string') {
-        packageId = packageId.trim();
-        if (packageId.length === 0) {
+        const packageIdStr = packageId.trim();
+        if (packageIdStr.length === 0) {
           this.logger.error('Invalid package identifier: empty string');
           throw new Error('Invalid package identifier: empty string');
         }
-        packageName = packageId.split('#')[0].split('@')[0];
-        packageVersion = this.getVersionFromPackageString(packageId);
+        packageName = packageIdStr.split('#')[0].split('@')[0];
+        packageVersion = this.getVersionFromPackageString(packageIdStr);
       } else {
         packageName = packageId.id;
         packageVersion = packageId.version || 'latest';
@@ -661,17 +660,17 @@ export class FhirPackageInstaller {
     return await fs.readJSON(manifestPath, { encoding: 'utf8' });
   }
 
-  public async getManifest(packageId: string | PackageIdentifier): Promise<PackageManifest> {
+  public async getManifest(packageId: string | FhirPackageIdentifier): Promise<PackageManifest> {
     try {
-      if (typeof packageId === 'string') {
-        packageId = await this.toPackageObject(packageId);
-      }
-      const manifestFile = await this.readManifestFile(path.join(await this.getPackageDirPath(packageId), 'package'));
+      const packageObj = typeof packageId === 'string' 
+        ? await this.toPackageObject(packageId)
+        : packageId;
+      const manifestFile = await this.readManifestFile(path.join(await this.getPackageDirPath(packageObj), 'package'));
       if (manifestFile) {
         return manifestFile;
       } else {
-        this.logger.warn(`Could not find package manifest for ${packageId.id}@${packageId.version}`);
-        return { name: packageId.id, version: packageId.version || 'unknown' };
+        this.logger.warn(`Could not find package manifest for ${packageObj.id}@${packageObj.version}`);
+        return { name: packageObj.id, version: packageObj.version || 'unknown' };
       }
     } catch (e) {
       throw this.prethrow(e);
@@ -692,7 +691,7 @@ export class FhirPackageInstaller {
    * Get the logger instance used by this FhirPackageInstaller.
   */
 
-  public getLogger(): ILogger {
+  public getLogger(): Logger {
     return this.logger;
   }
 
@@ -756,7 +755,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package to check for implicit dependencies
    * @returns Promise resolving to record of implicit dependencies
    */
-  private async getImplicitDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+  private async getImplicitDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     const implicitDeps: Record<string, string> = {};
     
     // Prevent recursion - if we're already resolving implicit deps for this package, return empty
@@ -799,7 +798,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package to get explicit dependencies for
    * @returns Promise resolving to record of explicit dependencies only
    */
-  private async getExplicitDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+  private async getExplicitDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     try {
       const deps = (await this.getManifest(packageObject))?.dependencies || {};
       // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
@@ -822,7 +821,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package to get dependencies for
    * @returns Promise resolving to record of all dependencies (explicit + implicit)
    */
-  public async getDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+  public async getDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     try {
       // Get explicit dependencies from package.json
       const explicitDeps = await this.getExplicitDependencies(packageObject);
@@ -837,9 +836,9 @@ export class FhirPackageInstaller {
     }
   }
 
-  public async install(packageId: string | PackageIdentifier): Promise<boolean> {
+  public async install(packageId: string | FhirPackageIdentifier): Promise<boolean> {
     try {
-      let packageObject: PackageIdentifier;
+      let packageObject: FhirPackageIdentifier;
       if (typeof packageId === 'string') {
         packageId = packageId.trim();
         if (packageId.length === 0) {
@@ -882,7 +881,7 @@ export class FhirPackageInstaller {
     }
   }
 
-  private async installPackageDependencies(packageObject: PackageIdentifier): Promise<void>{
+  private async installPackageDependencies(packageObject: FhirPackageIdentifier): Promise<void>{
     await this.getPackageIndexFile(packageObject);
     
     // Get all dependencies (explicit + implicit) using the updated getDependencies method
@@ -927,7 +926,7 @@ export class FhirPackageInstaller {
         finalPath = await this.extractTarball(fullPath);
       }
     
-      let packageObject: PackageIdentifier;
+      let packageObject: FhirPackageIdentifier;
       if (options?.packageId) {
         packageObject = await this.toPackageObject(options.packageId);
       } else {
@@ -966,14 +965,14 @@ export class FhirPackageInstaller {
    * - If `extract` is false or omitted: downloads the tarball as a .tgz file to the destination directory.
    * - If `extract` is true: downloads and extracts the package into a subdirectory of the destination path.
    *
-   * @param packageId A package identifier string or a PackageIdentifier object.
+   * @param packageId A package identifier string or a FhirPackageIdentifier object.
    * @param options Options controlling the download and extraction behavior.
    * @returns 
    * - If `extract` is false: the full path to the downloaded tarball file.
    * - If `extract` is true: the full path to the extracted package directory.
    */
   public async downloadPackage(
-    packageId: string | PackageIdentifier,
+    packageId: string | FhirPackageIdentifier,
     options?: DownloadPackageOptions): Promise<string> 
   {
     try {
@@ -1020,8 +1019,6 @@ const fpi = new FhirPackageInstaller();
 export default fpi;
 
 export type {
-  ILogger,
-  PackageIdentifier,
   PackageIndex,
   PackageManifest,
   FileInPackageIndex,

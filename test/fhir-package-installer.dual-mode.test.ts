@@ -2,16 +2,16 @@ import path from 'path';
 import temp from 'temp';
 import fs from 'fs-extra';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import type { ILogger } from 'fhir-package-installer';
+import type { Logger } from '@outburn/types';
 import { DualModeTestRunner, type TestContext } from './dual-mode-test-runner.js';
 
-const noopLogger: ILogger = {
+const noopLogger: Logger = {
   info: () => {},
   warn: () => {},
   error: () => {},
 };
 
-const debugLogger: ILogger = {
+const debugLogger: Logger = {
   info: (msg) => console.log('[INFO]', msg),
   warn: (msg) => console.warn('[WARN]', msg),
   error: (msg) => console.error('[ERROR]', msg)

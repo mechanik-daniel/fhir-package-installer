@@ -4,9 +4,10 @@ import fs from 'fs-extra';
 import { describe, it, expect, beforeAll } from 'vitest';
 
 import { FhirPackageInstaller, MemoryLatestVersionCache } from 'fhir-package-installer';
-import type { FileInPackageIndex, ILogger } from 'fhir-package-installer';
+import type { FileInPackageIndex } from 'fhir-package-installer';
+import type { Logger } from '@outburn/types';
 
-const noopLogger: ILogger = {
+const noopLogger: Logger = {
   info: () => {},
   warn: () => {},
   error: () => {},
@@ -125,7 +126,7 @@ describe('fhir-package-installer module', () => {
     expect(manifest2.name).toBe(heavyPackage.id);
   });
 
-  it('should parse a package string to a valid PackageIdentifier object', async () => {
+  it('should parse a package string to a valid FhirPackageIdentifier object', async () => {
     const obj = await testFpi.toPackageObject('pkg.name@1.0.0');
     expect(obj).toEqual({ id: 'pkg.name', version: '1.0.0' });
   });

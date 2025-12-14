@@ -1,4 +1,3 @@
-export type { Logger as ILogger, FhirPackageIdentifier as PackageIdentifier } from '@outburn/types';
 export type { PackageIndex } from './PackageIndex';
 export type { PackageManifest } from './PackageManifest';
 export type { PackageResource } from './PackageResource';

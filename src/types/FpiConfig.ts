@@ -3,14 +3,14 @@
  *   Project name: FHIR-Package-Installer
  */
 
-import { ILogger } from './index';
+import { Logger } from '@outburn/types';
 import { ILatestVersionCache } from './LatestVersionCache';
 
 /**
  * The structure of the FPI constructor config object.
  */
 export interface FpiConfig {
-    logger?: ILogger
+    logger?: Logger
     registryUrl?: string
     registryToken?: string
     cachePath?: string
