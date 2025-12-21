@@ -109,7 +109,7 @@ export class FhirPackageInstaller {
   private registryToken?: string; // optional token for private registries
   private fallbackUrlBase = 'https://packages.simplifier.net';
   private requestTimeoutMs = 90000; // 90 seconds
-  private extractTimeoutMs = 240000; // 4 minutes
+  private extractTimeoutMs = 60000; // 60 seconds
   /**
    * Path to the FHIR package cache directory.
    * This directory is used to store downloaded and extracted FHIR packages.
