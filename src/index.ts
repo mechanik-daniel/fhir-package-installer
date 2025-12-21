@@ -446,38 +446,6 @@ export class FhirPackageInstaller {
     }
   }  
 
-  private async withTimeout<T>(
-    promise: Promise<T>,
-    timeoutMs: number,
-    label: string,
-    onTimeout?: () => void
-  ): Promise<T> {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      return await promise;
-    }
-
-    let timeoutHandle: NodeJS.Timeout | undefined;
-    const timeoutPromise = new Promise<T>((_, reject) => {
-      timeoutHandle = setTimeout(() => {
-        try {
-          onTimeout?.();
-        } finally {
-          const err: any = new Error(`${label} timed out after ${timeoutMs}ms`);
-          err.code = 'ETIMEDOUT';
-          reject(err);
-        }
-      }, timeoutMs);
-    });
-
-    try {
-      return await Promise.race([promise, timeoutPromise]);
-    } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-    }
-  }
-
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
     return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
   }
@@ -552,17 +520,70 @@ export class FhirPackageInstaller {
     const tempDirectory = temp.mkdirSync();
     this.logger.info(`Extracting package to ${tempDirectory}`);
     const extract = tar.extract();
+
+    // Inactivity timeout: reset whenever we see extraction progress (data or entry completion).
+    // This avoids timing out on very large packages (e.g., *examples*) that can legitimately take a long time.
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    let rejectTimeout: ((err: any) => void) | undefined;
+    const armInactivityTimeout = () => {
+      if (!Number.isFinite(this.extractTimeoutMs) || this.extractTimeoutMs <= 0) {
+        return;
+      }
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      timeoutHandle = setTimeout(() => {
+        try {
+          try {
+            tarballStream.destroy(new Error('Tarball extraction timeout'));
+          } catch {
+            // ignore
+          }
+          try {
+            extract.destroy(new Error('Tarball extraction timeout'));
+          } catch {
+            // ignore
+          }
+        } finally {
+          const err: any = new Error(`Tarball extraction made no progress for ${this.extractTimeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          rejectTimeout?.(err);
+        }
+      }, this.extractTimeoutMs);
+    };
+    const touchProgress = () => armInactivityTimeout();
+
+    // Start the inactivity timer immediately and keep it alive while bytes flow.
+    armInactivityTimeout();
+    tarballStream.on('data', touchProgress);
+    tarballStream.on('error', touchProgress);
+
+    // Progress logs for very large packages (e.g., *examples*)
+    let completedEntries = 0;
+    const progressLogIntervalMs = 30000;
+    const progressLogHandle = setInterval(() => {
+      this.logger.info(`Extracting package... completed ${completedEntries} entries so far`);
+    }, progressLogIntervalMs);
+    // Don't keep the process alive only for progress logging
+    (progressLogHandle as any).unref?.();
   
     extract.on('entry', (header, stream, next) => {
       const fullPath = path.join(tempDirectory, header.name);
       const folderInTarball = path.dirname(header.name);
       const fileName = path.basename(header.name);
+
+      touchProgress();
   
       try {
         if (header.type === 'directory') {
           fs.ensureDirSync(fullPath);
+          touchProgress();
           stream.resume();
-          stream.on('end', () => next());
+          stream.on('end', () => {
+            completedEntries++;
+            touchProgress();
+            next();
+          });
           stream.on('error', (err) => {
             extract.emit('error', err);
             next();
@@ -572,8 +593,13 @@ export class FhirPackageInstaller {
 
         if (header.type !== 'file') {
           // Drain unknown entry types to avoid stalling extraction
+          touchProgress();
           stream.resume();
-          stream.on('end', () => next());
+          stream.on('end', () => {
+            completedEntries++;
+            touchProgress();
+            next();
+          });
           stream.on('error', (err) => {
             extract.emit('error', err);
             next();
@@ -586,6 +612,7 @@ export class FhirPackageInstaller {
 
         // IMPORTANT: tar-stream requires us to fully consume the entry stream
         // before calling next(), otherwise extraction can hang.
+        stream.on('data', touchProgress);
         const writePromise = pipeline(stream, fs.createWriteStream(fullPath));
 
         writePromise
@@ -607,6 +634,7 @@ export class FhirPackageInstaller {
                   } catch (err) {
                     console.error(`Failed to parse ${fileName}:`, err);
                   }
+                  touchProgress();
                 })
               );
             }
@@ -615,6 +643,8 @@ export class FhirPackageInstaller {
             extract.emit('error', err);
           })
           .finally(() => {
+            completedEntries++;
+            touchProgress();
             next();
           });
       } catch (err) {
@@ -628,7 +658,7 @@ export class FhirPackageInstaller {
         next();
       }
     });
-  
+
     const extractionPromise = (async () => {
       await pipeline(
         tarballStream,
@@ -639,23 +669,20 @@ export class FhirPackageInstaller {
       await Promise.all(handleEntryPromises);
     })();
 
-    await this.withTimeout(
-      extractionPromise,
-      this.extractTimeoutMs,
-      'Tarball extraction',
-      () => {
-        try {
-          tarballStream.destroy(new Error('Tarball extraction timeout'));
-        } catch {
-          // ignore
-        }
-        try {
-          extract.destroy(new Error('Tarball extraction timeout'));
-        } catch {
-          // ignore
-        }
+    const inactivityTimeoutPromise = new Promise<void>((_, reject) => {
+      rejectTimeout = reject;
+    });
+
+    try {
+      await Promise.race([extractionPromise, inactivityTimeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
       }
-    );
+      tarballStream.off('data', touchProgress);
+      tarballStream.off('error', touchProgress);
+      clearInterval(progressLogHandle);
+    }
   
     const indexJson: PackageIndex = {
       'index-version': 2,
