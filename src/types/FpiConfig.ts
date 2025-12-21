@@ -17,5 +17,7 @@ export interface FpiConfig {
     skipExamples?: boolean // skip dependency installation of example packages
     allowHttp?: boolean // allow HTTP URLs for testing (default: false)
     latestVersionCache?: ILatestVersionCache // cache for FHIR package latest versions (default: in-memory cache with 5-minute TTL)
+    requestTimeoutMs?: number // HTTP request timeout (default: 120000)
+    extractTimeoutMs?: number // tarball extraction timeout (default: 600000)
   }
   

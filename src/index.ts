@@ -108,6 +108,8 @@ export class FhirPackageInstaller {
   private registryUrl = 'https://packages.fhir.org';
   private registryToken?: string; // optional token for private registries
   private fallbackUrlBase = 'https://packages.simplifier.net';
+  private requestTimeoutMs = 90000; // 90 seconds
+  private extractTimeoutMs = 240000; // 4 minutes
   /**
    * Path to the FHIR package cache directory.
    * This directory is used to store downloaded and extracted FHIR packages.
@@ -122,7 +124,17 @@ export class FhirPackageInstaller {
   private installingPackages = new Set<string>();
   
   constructor(config?: FpiConfig) {
-    const { logger, registryUrl, registryToken, cachePath, skipExamples, allowHttp, latestVersionCache } = config || {} as FpiConfig;
+    const {
+      logger,
+      registryUrl,
+      registryToken,
+      cachePath,
+      skipExamples,
+      allowHttp,
+      latestVersionCache,
+      requestTimeoutMs,
+      extractTimeoutMs
+    } = config || {} as FpiConfig;
     if (registryUrl) {
       this.registryUrl = registryUrl;
     }
@@ -134,6 +146,13 @@ export class FhirPackageInstaller {
     }
     if (allowHttp) {
       this.allowHttp = allowHttp;
+    }
+
+    if (typeof requestTimeoutMs === 'number' && Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) {
+      this.requestTimeoutMs = requestTimeoutMs;
+    }
+    if (typeof extractTimeoutMs === 'number' && Number.isFinite(extractTimeoutMs) && extractTimeoutMs > 0) {
+      this.extractTimeoutMs = extractTimeoutMs;
     }
     if (logger) {
       this.logger = logger;
@@ -166,7 +185,12 @@ export class FhirPackageInstaller {
       } catch (err: any) {
         lastError = err;
         const isTemporary =
-          err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND' || err.code === 'ECONNRESET';
+          err.code === 'EAI_AGAIN' ||
+          err.code === 'ENOTFOUND' ||
+          err.code === 'ECONNRESET' ||
+          err.code === 'ETIMEDOUT' ||
+          err.code === 'ECONNABORTED' ||
+          err.message === 'aborted';
   
         if (!isTemporary || attempt === retries) {
           throw err;
@@ -290,7 +314,7 @@ export class FhirPackageInstaller {
       }
       
       const client = isHttps ? https : http;
-      client.get(url, options, (res) => {
+      const req = client.get(url, options, (res) => {
         // Handle redirects (301, 302, 303, 307, 308)
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           if (redirectCount >= maxRedirects) {
@@ -310,6 +334,13 @@ export class FhirPackageInstaller {
           return;
         }
         
+        // Apply a per-request inactivity timeout while reading the response
+        res.setTimeout(this.requestTimeoutMs, () => {
+          const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+          timeoutErr.code = 'ETIMEDOUT';
+          res.destroy(timeoutErr);
+        });
+
         let data = '';
         res.on('data', (chunk) => (data += chunk));
         res.on('end', () => {
@@ -341,7 +372,15 @@ export class FhirPackageInstaller {
             reject(new Error(`Failed to parse JSON from ${url}: ${e}`));
           }
         });
-      }).on('error', reject);
+      });
+
+      req.setTimeout(this.requestTimeoutMs, () => {
+        const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+        timeoutErr.code = 'ETIMEDOUT';
+        req.destroy(timeoutErr);
+      });
+
+      req.on('error', reject);
     }));
   }  
 
@@ -361,7 +400,7 @@ export class FhirPackageInstaller {
         }
         
         const client = isHttps ? https : http;
-        client.get(url, options, (res) => {
+        const req = client.get(url, options, (res) => {
           // Handle redirects (301, 302, 303, 307, 308)
           if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             if (redirectCount >= maxRedirects) {
@@ -382,17 +421,62 @@ export class FhirPackageInstaller {
           }
           
           if (res.statusCode === 200) {
+            res.setTimeout(this.requestTimeoutMs, () => {
+              const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+              timeoutErr.code = 'ETIMEDOUT';
+              res.destroy(timeoutErr);
+            });
             resolve(res);
           } else {
             reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
           }
-        }).on('error', reject);
+        });
+
+        req.setTimeout(this.requestTimeoutMs, () => {
+          const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+          timeoutErr.code = 'ETIMEDOUT';
+          req.destroy(timeoutErr);
+        });
+
+        req.on('error', reject);
       }));      
     } catch (e) {
       this.logger.error(`Failed to fetch stream from ${url}`);
       throw e;
     }
   }  
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    label: string,
+    onTimeout?: () => void
+  ): Promise<T> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return await promise;
+    }
+
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        try {
+          onTimeout?.();
+        } finally {
+          const err: any = new Error(`${label} timed out after ${timeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          reject(err);
+        }
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
 
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
     return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
@@ -474,52 +558,104 @@ export class FhirPackageInstaller {
       const folderInTarball = path.dirname(header.name);
       const fileName = path.basename(header.name);
   
-      // Always ensure directory exists
-      fs.ensureDirSync(path.dirname(fullPath));
-  
-      // Push the write+index task into the limit-controlled queue:
-      const task = limit(async () => {
-        // Pipe to disk
-        await new Promise<void>((resolve, reject) => {
-          const fileWriteStream = fs.createWriteStream(fullPath);
-          stream.pipe(fileWriteStream);
-          stream.on('error', reject);
-          fileWriteStream.on('finish', resolve);
-          fileWriteStream.on('error', reject);
-        });
-  
-        // Collect metadata if applicable
-        if (
-          header.type === 'file' &&
-          folderInTarball === 'package' &&
-          fileName.endsWith('.json') &&
-          fileName !== 'package.json' &&
-          !fileName.endsWith('.index.json')
-        ) {
-          const contentBuffer = await fs.readFile(fullPath, 'utf8');
-          try {
-            const content = shallowParse(contentBuffer) as PackageResource;
-            const indexEntry = extractResourceIndexEntry(fileName, content);
-            indexEntries.push(indexEntry);
-          } catch (err) {
-            console.error(`Failed to parse ${fileName}:`, err);
-          }
+      try {
+        if (header.type === 'directory') {
+          fs.ensureDirSync(fullPath);
+          stream.resume();
+          stream.on('end', () => next());
+          stream.on('error', (err) => {
+            extract.emit('error', err);
+            next();
+          });
+          return;
         }
-      });
-  
-      handleEntryPromises.push(task);
-  
-      // Immediately move on to next entry
-      next();
+
+        if (header.type !== 'file') {
+          // Drain unknown entry types to avoid stalling extraction
+          stream.resume();
+          stream.on('end', () => next());
+          stream.on('error', (err) => {
+            extract.emit('error', err);
+            next();
+          });
+          return;
+        }
+
+        // Always ensure directory exists
+        fs.ensureDirSync(path.dirname(fullPath));
+
+        // IMPORTANT: tar-stream requires us to fully consume the entry stream
+        // before calling next(), otherwise extraction can hang.
+        const writePromise = pipeline(stream, fs.createWriteStream(fullPath));
+
+        writePromise
+          .then(() => {
+            // Only rate-limit/parallelize the *parsing*, not the draining.
+            if (
+              folderInTarball === 'package' &&
+              fileName.endsWith('.json') &&
+              fileName !== 'package.json' &&
+              !fileName.endsWith('.index.json')
+            ) {
+              handleEntryPromises.push(
+                limit(async () => {
+                  const contentBuffer = await fs.readFile(fullPath, 'utf8');
+                  try {
+                    const content = shallowParse(contentBuffer) as PackageResource;
+                    const indexEntry = extractResourceIndexEntry(fileName, content);
+                    indexEntries.push(indexEntry);
+                  } catch (err) {
+                    console.error(`Failed to parse ${fileName}:`, err);
+                  }
+                })
+              );
+            }
+          })
+          .catch((err) => {
+            extract.emit('error', err);
+          })
+          .finally(() => {
+            next();
+          });
+      } catch (err) {
+        // Ensure we don't stall extraction if something throws synchronously
+        try {
+          stream.resume();
+        } catch {
+          // ignore
+        }
+        extract.emit('error', err);
+        next();
+      }
     });
   
-    await pipeline(
-      tarballStream,
-      zlib.createGunzip(),
-      extract
+    const extractionPromise = (async () => {
+      await pipeline(
+        tarballStream,
+        zlib.createGunzip(),
+        extract
+      );
+
+      await Promise.all(handleEntryPromises);
+    })();
+
+    await this.withTimeout(
+      extractionPromise,
+      this.extractTimeoutMs,
+      'Tarball extraction',
+      () => {
+        try {
+          tarballStream.destroy(new Error('Tarball extraction timeout'));
+        } catch {
+          // ignore
+        }
+        try {
+          extract.destroy(new Error('Tarball extraction timeout'));
+        } catch {
+          // ignore
+        }
+      }
     );
-  
-    await Promise.all(handleEntryPromises);
   
     const indexJson: PackageIndex = {
       'index-version': 2,
