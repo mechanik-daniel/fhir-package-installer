@@ -19,15 +19,19 @@ import semver from 'semver';
 import shallowParse from './shallowParse';
 
 import type {
-  FpiConfig,
   FileInPackageIndex,
   PackageIndex,
-  PackageManifest,
+  PackageManifest
+} from '@outburn/types';
+
+import type {
+  FpiConfig,
   PackageResource,
   DownloadPackageOptions,
   InstallPackageOptions,
   ILatestVersionCache
 } from './types';
+
 import { MemoryLatestVersionCache } from './types';
 import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
@@ -1182,9 +1186,6 @@ const fpi = new FhirPackageInstaller();
 export default fpi;
 
 export type {
-  PackageIndex,
-  PackageManifest,
-  FileInPackageIndex,
   PackageResource,
   DownloadPackageOptions,
   InstallPackageOptions,
@@ -1192,4 +1193,11 @@ export type {
   ILatestVersionCache
 } from './types';
 
+export type {
+  PackageIndex,
+  PackageManifest,
+  FileInPackageIndex
+} from '@outburn/types';
+
 export { MemoryLatestVersionCache } from './types';
+
