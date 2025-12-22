@@ -56,6 +56,8 @@ const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
   ]
 };
 
+const IMPLICIT_LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 /**
  * default logger uses global console methods
  */
@@ -887,6 +889,59 @@ export class FhirPackageInstaller {
     }
   }
 
+  private sanitizeImplicitLatestCacheFileName(packageName: string): string {
+    // Package names should be safe, but ensure no path traversal / illegal characters.
+    // Keep dots to match requested format; replace path separators and Windows-illegal chars.
+    return packageName.replace(/[\\/]/g, '_').replace(/[<>:"|?*]/g, '_');
+  }
+
+  private getImplicitLatestVersionCacheFilePath(packageName: string): string {
+    const safeName = this.sanitizeImplicitLatestCacheFileName(packageName);
+    return path.join(this.cachePath, `.fpi.latest.${safeName}`);
+  }
+
+  private async readImplicitLatestVersionFromDisk(packageName: string): Promise<string | null> {
+    try {
+      const cacheFilePath = this.getImplicitLatestVersionCacheFilePath(packageName);
+      if (!await fs.exists(cacheFilePath)) {
+        return null;
+      }
+
+      const cacheData = await fs.readJSON(cacheFilePath, { encoding: 'utf8' });
+      const version = cacheData?.version;
+      const expiresAt = cacheData?.expiresAt;
+      if (typeof version !== 'string' || version.trim().length === 0) {
+        return null;
+      }
+      if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
+        return null;
+      }
+      if (Date.now() >= expiresAt) {
+        return null;
+      }
+
+      return version;
+    } catch {
+      // Ignore corrupted cache files; we'll fall back to online lookup.
+      return null;
+    }
+  }
+
+  private async writeImplicitLatestVersionToDisk(packageName: string, version: string): Promise<void> {
+    const cacheFilePath = this.getImplicitLatestVersionCacheFilePath(packageName);
+    const expiresAt = Date.now() + IMPLICIT_LATEST_VERSION_TTL_MS;
+
+    // Ensure cache root exists (it may not, if only getDependencies() is used).
+    await fs.ensureDir(this.cachePath);
+
+    // Best-effort write; don't fail installs if we can't persist the cache.
+    try {
+      await fs.writeJSON(cacheFilePath, { version, expiresAt });
+    } catch {
+      // ignore
+    }
+  }
+
   /**
    * Resolve the latest version for an implicit package dependency
    * Tries online registry first, then falls back to latest cached version
@@ -894,9 +949,17 @@ export class FhirPackageInstaller {
    * @returns Resolved version or throws if no version found
    */
   private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
-    // First try to get the latest version from registry (using existing cache)
+    // Prefer a shared (disk) cache so multiple FPI instances can avoid repeated registry calls.
+    const diskCached = await this.readImplicitLatestVersionFromDisk(packageName);
+    if (diskCached) {
+      this.latestVersionCache.set(packageName, diskCached);
+      return diskCached;
+    }
+
+    // Next try to get the latest version from registry (using existing in-memory cache)
     try {
       const latest = await this.checkLatestPackageDist(packageName);
+      await this.writeImplicitLatestVersionToDisk(packageName, latest);
       return latest;
     } catch (onlineError: any) {
       this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
@@ -912,6 +975,9 @@ export class FhirPackageInstaller {
       
       // Update the cache with this fallback version so other operations can reuse it
       this.latestVersionCache.set(packageName, latestCached);
+
+      // Also update the shared (disk) cache so other instances can reuse it.
+      await this.writeImplicitLatestVersionToDisk(packageName, latestCached);
       
       return latestCached;
     }
