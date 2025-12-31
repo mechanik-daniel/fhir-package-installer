@@ -838,7 +838,7 @@ export class FhirPackageInstaller {
       if (manifestFile) {
         return manifestFile;
       } else {
-        this.logger.warn(`Could not find package manifest for ${packageObj.id}@${packageObj.version}`);
+        this.logger.warn(`Could not find package manifest for ${packageObj.id}${packageObj.version ? '@' + packageObj.version : ''}`);
         return { name: packageObj.id, version: packageObj.version || 'unknown' };
       }
     } catch (e) {
