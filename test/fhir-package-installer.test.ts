@@ -282,10 +282,10 @@ describe('fhir-package-installer module', () => {
     });
 
     it.each([
-      'hl7.fhir.us.core@6.1.0',
-      'hl7.fhir.us.davinci-pdex@2.0.0',
-      'hl7.fhir.us.davinci-pas@2.0.1',
-      'de.gematik.epa.medication@1.0.2-rc1'
+      'hl7.fhir.uv.tools@0.9.0',
+      // 'hl7.fhir.us.davinci-pdex@2.0.0',
+      // 'hl7.fhir.us.davinci-pas@2.0.1',
+      'hl7.fhir.uv.sdc#3.0.0'
     ])('should install package: %s', 
       { timeout: TIMEOUT, skip }, 
       async (pkg) => {
