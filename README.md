@@ -71,20 +71,6 @@ import fpi from 'fhir-package-installer'; // ESM
 const fpi = require('fhir-package-installer').default; // CJS
 ```
 
-### TypeScript Consumers
-
-Type declarations resolve automatically via the `exports` map:
-
-```ts
-import { FhirPackageInstaller, PackageIdentifier } from 'fhir-package-installer';
-```
-
-No additional `types` configuration is required.
-
----
-
----
-
 ## Advanced Usage (Custom Configurations)
 
 Use the `FhirPackageInstaller` class directly to customize behavior:
@@ -107,7 +93,7 @@ await customFpi.install('hl7.fhir.r4.core');
 ```
 
 ### `FpiConfig` fields:
-- `logger` – Optional. Custom logger implementing the `ILogger` interface.
+- `logger` – Optional. Custom logger implementing the `Logger` interface (from `@outburn/types`).
 - `registryUrl` – Optional. Custom package registry base URL (e.g., JFrog Artifactory).
 - `registryToken` – Optional. Authentication token for private registries.
 - `cachePath` – Optional. Directory where packages will be cached.
@@ -118,13 +104,13 @@ await customFpi.install('hl7.fhir.r4.core');
 
 ## Public API Methods
 
-### `install(packageId: string | PackageIdentifier): Promise<boolean>`
+### `install(packageId: string | FhirPackageIdentifier): Promise<boolean>`
 Downloads and installs a package and all its dependencies.  
-Accepts either a package identifier object (`{ id, version }`) or a string (`'name@version'`, `'name#version'`, or `'name'`).
+Accepts either a package identifier object (`{ id, version }` from `@outburn/types`) or a string (`'name@version'`, `'name#version'`, or `'name'`).
 
 ---
 
-### `downloadPackage(packageId: string | PackageIdentifier, options?: DownloadPackageOptions): Promise<string>`
+### `downloadPackage(packageId: string | FhirPackageIdentifier, options?: DownloadPackageOptions): Promise<string>`
 Downloads a package tarball and optionally extracts it to a destination directory.
 
 ---
@@ -135,18 +121,18 @@ The package can be a tarball file or a directory containing the package files.
 
 ---
 
-### `getManifest(packageId: string | PackageIdentifier): Promise<PackageManifest>`
+### `getManifest(packageId: string | FhirPackageIdentifier): Promise<PackageManifest>`
 Fetches the `package.json` manifest of an installed package.
 
 ---
 
-### `getPackageIndexFile(packageId: string | PackageIdentifier): Promise<PackageIndex>`
+### `getPackageIndexFile(packageId: string | FhirPackageIdentifier): Promise<PackageIndex>`
 Returns the `.fpi.index.json` content for the package.  
 If the file doesn't exist, it will be generated automatically.
 
 ---
 
-### `getDependencies(packageId: string | PackageIdentifier): Promise<Record<string, string>>`
+### `getDependencies(packageId: string | FhirPackageIdentifier): Promise<Record<string, string>>`
 Returns the direct dependencies of a package, including both explicit dependencies defined in `package.json` and automatic implicit dependencies (for core FHIR packages).
 
 ---
@@ -156,13 +142,13 @@ Looks up the latest published version for a given package name (string only).
 
 ---
 
-### `toPackageObject(packageId: string | PackageIdentifier): Promise<PackageIdentifier>`
+### `toPackageObject(packageId: string | FhirPackageIdentifier): Promise<FhirPackageIdentifier>`
 Parses `name`, `name@version`, or `name#version` into an object with `id` and `version`.  
 If no version is provided, resolves to the latest.
 
 ---
 
-### `isInstalled(packageId: string | PackageIdentifier): Promise<boolean>`
+### `isInstalled(packageId: string | FhirPackageIdentifier): Promise<boolean>`
 Returns `true` if the package is already present in the local cache.
 
 ---
@@ -172,12 +158,12 @@ Returns the root cache directory used by this installer.
 
 ---
 
-### `getLogger(): ILogger`
+### `getLogger(): Logger`
 Returns the logger instance used by this installer.
 
 ---
 
-### `getPackageDirPath(packageId: string | PackageIdentifier): Promise<string>`
+### `getPackageDirPath(packageId: string | FhirPackageIdentifier): Promise<string>`
 Returns the path to a specific package folder in the cache.
 
 ---

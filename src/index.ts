@@ -19,18 +19,21 @@ import semver from 'semver';
 import shallowParse from './shallowParse';
 
 import type {
-  ILogger,
-  FpiConfig,
   FileInPackageIndex,
-  PackageIdentifier,
   PackageIndex,
-  PackageManifest,
+  PackageManifest
+} from '@outburn/types';
+
+import type {
+  FpiConfig,
   PackageResource,
   DownloadPackageOptions,
   InstallPackageOptions,
   ILatestVersionCache
 } from './types';
+
 import { MemoryLatestVersionCache } from './types';
+import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
 temp.track();
 
@@ -53,10 +56,12 @@ const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
   ]
 };
 
+const IMPLICIT_LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 /**
  * default logger uses global console methods
  */
-const defaultLogger: ILogger = {
+const defaultLogger: Logger = {
   info: (msg: any) => console.log(msg),
   warn: (msg: any) => console.warn(msg),
   error: (msg: any) => console.error(msg)
@@ -105,10 +110,12 @@ const extractResourceIndexEntry = (filename: string, content: PackageResource): 
 };
 
 export class FhirPackageInstaller {
-  private logger: ILogger = defaultLogger;
+  private logger: Logger = defaultLogger;
   private registryUrl = 'https://packages.fhir.org';
   private registryToken?: string; // optional token for private registries
   private fallbackUrlBase = 'https://packages.simplifier.net';
+  private requestTimeoutMs = 90000; // 90 seconds
+  private extractTimeoutMs = 60000; // 60 seconds
   /**
    * Path to the FHIR package cache directory.
    * This directory is used to store downloaded and extracted FHIR packages.
@@ -123,7 +130,17 @@ export class FhirPackageInstaller {
   private installingPackages = new Set<string>();
   
   constructor(config?: FpiConfig) {
-    const { logger, registryUrl, registryToken, cachePath, skipExamples, allowHttp, latestVersionCache } = config || {} as FpiConfig;
+    const {
+      logger,
+      registryUrl,
+      registryToken,
+      cachePath,
+      skipExamples,
+      allowHttp,
+      latestVersionCache,
+      requestTimeoutMs,
+      extractTimeoutMs
+    } = config || {} as FpiConfig;
     if (registryUrl) {
       this.registryUrl = registryUrl;
     }
@@ -135,6 +152,13 @@ export class FhirPackageInstaller {
     }
     if (allowHttp) {
       this.allowHttp = allowHttp;
+    }
+
+    if (typeof requestTimeoutMs === 'number' && Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) {
+      this.requestTimeoutMs = requestTimeoutMs;
+    }
+    if (typeof extractTimeoutMs === 'number' && Number.isFinite(extractTimeoutMs) && extractTimeoutMs > 0) {
+      this.extractTimeoutMs = extractTimeoutMs;
     }
     if (logger) {
       this.logger = logger;
@@ -167,7 +191,12 @@ export class FhirPackageInstaller {
       } catch (err: any) {
         lastError = err;
         const isTemporary =
-          err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND' || err.code === 'ECONNRESET';
+          err.code === 'EAI_AGAIN' ||
+          err.code === 'ENOTFOUND' ||
+          err.code === 'ECONNRESET' ||
+          err.code === 'ETIMEDOUT' ||
+          err.code === 'ECONNABORTED' ||
+          err.message === 'aborted';
   
         if (!isTemporary || attempt === retries) {
           throw err;
@@ -183,21 +212,21 @@ export class FhirPackageInstaller {
   }
 
   /**
-   * Takes a PackageIdentifier Object and returns the corresponding directory name of the package
+   * Takes a FhirPackageIdentifier Object and returns the corresponding directory name of the package
    * @param packageObject A PackageObject with both name and version keys
    * @returns (string) Directory name in the standard format `name#version`
    */
-  private async toDirName(packageId: PackageIdentifier | string): Promise<string> {
-    packageId = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
-    return packageId.id + '#' + packageId.version;
+  private async toDirName(packageId: FhirPackageIdentifier | string): Promise<string> {
+    const packageObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    return packageObj.id + '#' + packageObj.version;
   }
 
   /**
-   * Takes a PackageIdentifier Object and returns the path to the package folder in the cache
-   * @param packageObject A PackageIdentifier Object with both name and version keys
+   * Takes a FhirPackageIdentifier Object and returns the path to the package folder in the cache
+   * @param packageObject A FhirPackageIdentifier Object with both name and version keys
    * @returns The full path to the package directory
    */
-  public async getPackageDirPath(packageId: PackageIdentifier | string): Promise<string> {
+  public async getPackageDirPath(packageId: FhirPackageIdentifier | string): Promise<string> {
     try {
       return path.join(this.cachePath, await this.toDirName(packageId));
     } catch (e) {
@@ -207,10 +236,10 @@ export class FhirPackageInstaller {
 
   /**
    * Get the full path to the .fpi.index.json file in the package folder
-   * @param packageObject A PackageIdentifier Object with both name and version keys
+   * @param packageObject A FhirPackageIdentifier Object with both name and version keys
    * @returns (string) The path to the package index file
    */
-  private async getPackageIndexPath(packageId: PackageIdentifier | string): Promise<string> {
+  private async getPackageIndexPath(packageId: FhirPackageIdentifier | string): Promise<string> {
     return path.join(await this.getPackageDirPath(packageId), 'package', '.fpi.index.json');
   }
 
@@ -220,7 +249,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package identifier object
    * @returns PackageIndex
    */
-  private async generatePackageIndex(packageId: PackageIdentifier | string): Promise<PackageIndex> {
+  private async generatePackageIndex(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
     const pckIdObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
     this.logger.info(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
     const packagePath = await this.getPackageDirPath(pckIdObj);
@@ -291,7 +320,7 @@ export class FhirPackageInstaller {
       }
       
       const client = isHttps ? https : http;
-      client.get(url, options, (res) => {
+      const req = client.get(url, options, (res) => {
         // Handle redirects (301, 302, 303, 307, 308)
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           if (redirectCount >= maxRedirects) {
@@ -311,6 +340,13 @@ export class FhirPackageInstaller {
           return;
         }
         
+        // Apply a per-request inactivity timeout while reading the response
+        res.setTimeout(this.requestTimeoutMs, () => {
+          const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+          timeoutErr.code = 'ETIMEDOUT';
+          res.destroy(timeoutErr);
+        });
+
         let data = '';
         res.on('data', (chunk) => (data += chunk));
         res.on('end', () => {
@@ -342,7 +378,15 @@ export class FhirPackageInstaller {
             reject(new Error(`Failed to parse JSON from ${url}: ${e}`));
           }
         });
-      }).on('error', reject);
+      });
+
+      req.setTimeout(this.requestTimeoutMs, () => {
+        const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+        timeoutErr.code = 'ETIMEDOUT';
+        req.destroy(timeoutErr);
+      });
+
+      req.on('error', reject);
     }));
   }  
 
@@ -362,7 +406,7 @@ export class FhirPackageInstaller {
         }
         
         const client = isHttps ? https : http;
-        client.get(url, options, (res) => {
+        const req = client.get(url, options, (res) => {
           // Handle redirects (301, 302, 303, 307, 308)
           if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             if (redirectCount >= maxRedirects) {
@@ -383,11 +427,24 @@ export class FhirPackageInstaller {
           }
           
           if (res.statusCode === 200) {
+            res.setTimeout(this.requestTimeoutMs, () => {
+              const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+              timeoutErr.code = 'ETIMEDOUT';
+              res.destroy(timeoutErr);
+            });
             resolve(res);
           } else {
             reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
           }
-        }).on('error', reject);
+        });
+
+        req.setTimeout(this.requestTimeoutMs, () => {
+          const timeoutErr: any = new Error(`Request timed out after ${this.requestTimeoutMs}ms while fetching ${url}`);
+          timeoutErr.code = 'ETIMEDOUT';
+          req.destroy(timeoutErr);
+        });
+
+        req.on('error', reject);
       }));      
     } catch (e) {
       this.logger.error(`Failed to fetch stream from ${url}`);
@@ -399,7 +456,7 @@ export class FhirPackageInstaller {
     return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
   }
 
-  private async getTarballUrl(packageObject: PackageIdentifier): Promise<string> {
+  private async getTarballUrl(packageObject: FhirPackageIdentifier): Promise<string> {
     const isPrivateRegistry = this.registryUrl !== 'https://packages.fhir.org';
     
     // Always fetch package metadata for validation and version information
@@ -411,7 +468,7 @@ export class FhirPackageInstaller {
     }
     
     // Validate that the specific version exists
-    if (!packageData.versions?.[packageObject.version]) {
+    if (!packageObject.version || !packageData.versions?.[packageObject.version]) {
       throw new Error(`Package ${packageObject.id}@${packageObject.version} not found in the registry at ${this.registryUrl}.`);
     }
     
@@ -421,7 +478,7 @@ export class FhirPackageInstaller {
     }
     
     // For the default registry, try to get the tarball URL from package metadata
-    const url = packageData.versions[packageObject.version]?.dist?.tarball ?? packageData.versions[packageObject.version]?.url;
+    const url = packageData.versions[packageObject.version!]?.dist?.tarball ?? packageData.versions[packageObject.version!]?.url;
     if (!url) {
       return `${this.fallbackUrlBase}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
     }
@@ -439,7 +496,7 @@ export class FhirPackageInstaller {
     }
   }
 
-  private async downloadTarball(packageObject: PackageIdentifier): Promise<string> {
+  private async downloadTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const tempDirectory = temp.mkdirSync();
     const tarballPath = path.join(tempDirectory, `${packageObject.id}-${packageObject.version}.tgz`);
     const tarballUrl = await this.getTarballUrl(packageObject);
@@ -469,58 +526,169 @@ export class FhirPackageInstaller {
     const tempDirectory = temp.mkdirSync();
     this.logger.info(`Extracting package to ${tempDirectory}`);
     const extract = tar.extract();
+
+    // Inactivity timeout: reset whenever we see extraction progress (data or entry completion).
+    // This avoids timing out on very large packages (e.g., *examples*) that can legitimately take a long time.
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    let rejectTimeout: ((err: any) => void) | undefined;
+    const armInactivityTimeout = () => {
+      if (!Number.isFinite(this.extractTimeoutMs) || this.extractTimeoutMs <= 0) {
+        return;
+      }
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      timeoutHandle = setTimeout(() => {
+        try {
+          try {
+            tarballStream.destroy(new Error('Tarball extraction timeout'));
+          } catch {
+            // ignore
+          }
+          try {
+            extract.destroy(new Error('Tarball extraction timeout'));
+          } catch {
+            // ignore
+          }
+        } finally {
+          const err: any = new Error(`Tarball extraction made no progress for ${this.extractTimeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          rejectTimeout?.(err);
+        }
+      }, this.extractTimeoutMs);
+    };
+    const touchProgress = () => armInactivityTimeout();
+
+    // Start the inactivity timer immediately and keep it alive while bytes flow.
+    armInactivityTimeout();
+    tarballStream.on('data', touchProgress);
+    tarballStream.on('error', touchProgress);
+
+    // Progress logs for very large packages (e.g., *examples*)
+    let completedEntries = 0;
+    const progressLogIntervalMs = 30000;
+    const progressLogHandle = setInterval(() => {
+      this.logger.info(`Extracting package... completed ${completedEntries} entries so far`);
+    }, progressLogIntervalMs);
+    // Don't keep the process alive only for progress logging
+    (progressLogHandle as any).unref?.();
   
     extract.on('entry', (header, stream, next) => {
       const fullPath = path.join(tempDirectory, header.name);
       const folderInTarball = path.dirname(header.name);
       const fileName = path.basename(header.name);
+
+      touchProgress();
   
-      // Always ensure directory exists
-      fs.ensureDirSync(path.dirname(fullPath));
-  
-      // Push the write+index task into the limit-controlled queue:
-      const task = limit(async () => {
-        // Pipe to disk
-        await new Promise<void>((resolve, reject) => {
-          const fileWriteStream = fs.createWriteStream(fullPath);
-          stream.pipe(fileWriteStream);
-          stream.on('error', reject);
-          fileWriteStream.on('finish', resolve);
-          fileWriteStream.on('error', reject);
-        });
-  
-        // Collect metadata if applicable
-        if (
-          header.type === 'file' &&
-          folderInTarball === 'package' &&
-          fileName.endsWith('.json') &&
-          fileName !== 'package.json' &&
-          !fileName.endsWith('.index.json')
-        ) {
-          const contentBuffer = await fs.readFile(fullPath, 'utf8');
-          try {
-            const content = shallowParse(contentBuffer) as PackageResource;
-            const indexEntry = extractResourceIndexEntry(fileName, content);
-            indexEntries.push(indexEntry);
-          } catch (err) {
-            console.error(`Failed to parse ${fileName}:`, err);
-          }
+      try {
+        if (header.type === 'directory') {
+          fs.ensureDirSync(fullPath);
+          touchProgress();
+          stream.resume();
+          stream.on('end', () => {
+            completedEntries++;
+            touchProgress();
+            next();
+          });
+          stream.on('error', (err) => {
+            extract.emit('error', err);
+            next();
+          });
+          return;
         }
-      });
-  
-      handleEntryPromises.push(task);
-  
-      // Immediately move on to next entry
-      next();
+
+        if (header.type !== 'file') {
+          // Drain unknown entry types to avoid stalling extraction
+          touchProgress();
+          stream.resume();
+          stream.on('end', () => {
+            completedEntries++;
+            touchProgress();
+            next();
+          });
+          stream.on('error', (err) => {
+            extract.emit('error', err);
+            next();
+          });
+          return;
+        }
+
+        // Always ensure directory exists
+        fs.ensureDirSync(path.dirname(fullPath));
+
+        // IMPORTANT: tar-stream requires us to fully consume the entry stream
+        // before calling next(), otherwise extraction can hang.
+        stream.on('data', touchProgress);
+        const writePromise = pipeline(stream, fs.createWriteStream(fullPath));
+
+        writePromise
+          .then(() => {
+            // Only rate-limit/parallelize the *parsing*, not the draining.
+            if (
+              folderInTarball === 'package' &&
+              fileName.endsWith('.json') &&
+              fileName !== 'package.json' &&
+              !fileName.endsWith('.index.json')
+            ) {
+              handleEntryPromises.push(
+                limit(async () => {
+                  const contentBuffer = await fs.readFile(fullPath, 'utf8');
+                  try {
+                    const content = shallowParse(contentBuffer) as PackageResource;
+                    const indexEntry = extractResourceIndexEntry(fileName, content);
+                    indexEntries.push(indexEntry);
+                  } catch (err) {
+                    console.error(`Failed to parse ${fileName}:`, err);
+                  }
+                  touchProgress();
+                })
+              );
+            }
+          })
+          .catch((err) => {
+            extract.emit('error', err);
+          })
+          .finally(() => {
+            completedEntries++;
+            touchProgress();
+            next();
+          });
+      } catch (err) {
+        // Ensure we don't stall extraction if something throws synchronously
+        try {
+          stream.resume();
+        } catch {
+          // ignore
+        }
+        extract.emit('error', err);
+        next();
+      }
     });
-  
-    await pipeline(
-      tarballStream,
-      zlib.createGunzip(),
-      extract
-    );
-  
-    await Promise.all(handleEntryPromises);
+
+    const extractionPromise = (async () => {
+      await pipeline(
+        tarballStream,
+        zlib.createGunzip(),
+        extract
+      );
+
+      await Promise.all(handleEntryPromises);
+    })();
+
+    const inactivityTimeoutPromise = new Promise<void>((_, reject) => {
+      rejectTimeout = reject;
+    });
+
+    try {
+      await Promise.race([extractionPromise, inactivityTimeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      tarballStream.off('data', touchProgress);
+      tarballStream.off('error', touchProgress);
+      clearInterval(progressLogHandle);
+    }
   
     const indexJson: PackageIndex = {
       'index-version': 2,
@@ -532,7 +700,7 @@ export class FhirPackageInstaller {
     return tempDirectory;
   }
 
-  private async downloadAndExtractTarball(packageObject: PackageIdentifier): Promise<string> {
+  private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const tarballUrl = await this.getTarballUrl(packageObject);
     this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
     const tarballStream = await this.fetchStream(tarballUrl);
@@ -547,7 +715,7 @@ export class FhirPackageInstaller {
    * @param move Whether to move the package to the cache or copy it. Defaults to **true**.
    * @returns The path to the cached package directory
    */
-  private async cachePackage(packageObject: PackageIdentifier, src: string, move: boolean = true): Promise<string> {
+  private async cachePackage(packageObject: FhirPackageIdentifier, src: string, move: boolean = true): Promise<string> {
     let finalPath = await this.getPackageDirPath(packageObject);
     if (!await fs.exists(path.join(src, 'package'))) {
       finalPath = path.join(finalPath, 'package');
@@ -582,7 +750,7 @@ export class FhirPackageInstaller {
     return 'latest';
   }
 
-  public async isInstalled(packageId: PackageIdentifier | string): Promise<boolean> {
+  public async isInstalled(packageId: FhirPackageIdentifier | string): Promise<boolean> {
     try {
       return await fs.exists(await this.getPackageDirPath(packageId));      
     } catch (e) {
@@ -590,7 +758,7 @@ export class FhirPackageInstaller {
     }
   }
 
-  public async getPackageIndexFile(packageId: PackageIdentifier | string): Promise<PackageIndex> {
+  public async getPackageIndexFile(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
     try {
       const indexPath = await this.getPackageIndexPath(packageId);
       if (await fs.exists(indexPath)) {
@@ -626,18 +794,18 @@ export class FhirPackageInstaller {
     }
   }
 
-  public async toPackageObject(packageId: string | PackageIdentifier): Promise<PackageIdentifier> {
+  public async toPackageObject(packageId: string | FhirPackageIdentifier): Promise<FhirPackageIdentifier> {
     try {
       let packageVersion: string;
       let packageName: string;
       if (typeof packageId === 'string') {
-        packageId = packageId.trim();
-        if (packageId.length === 0) {
+        const packageIdStr = packageId.trim();
+        if (packageIdStr.length === 0) {
           this.logger.error('Invalid package identifier: empty string');
           throw new Error('Invalid package identifier: empty string');
         }
-        packageName = packageId.split('#')[0].split('@')[0];
-        packageVersion = this.getVersionFromPackageString(packageId);
+        packageName = packageIdStr.split('#')[0].split('@')[0];
+        packageVersion = this.getVersionFromPackageString(packageIdStr);
       } else {
         packageName = packageId.id;
         packageVersion = packageId.version || 'latest';
@@ -661,17 +829,17 @@ export class FhirPackageInstaller {
     return await fs.readJSON(manifestPath, { encoding: 'utf8' });
   }
 
-  public async getManifest(packageId: string | PackageIdentifier): Promise<PackageManifest> {
+  public async getManifest(packageId: string | FhirPackageIdentifier): Promise<PackageManifest> {
     try {
-      if (typeof packageId === 'string') {
-        packageId = await this.toPackageObject(packageId);
-      }
-      const manifestFile = await this.readManifestFile(path.join(await this.getPackageDirPath(packageId), 'package'));
+      const packageObj = typeof packageId === 'string' 
+        ? await this.toPackageObject(packageId)
+        : packageId;
+      const manifestFile = await this.readManifestFile(path.join(await this.getPackageDirPath(packageObj), 'package'));
       if (manifestFile) {
         return manifestFile;
       } else {
-        this.logger.warn(`Could not find package manifest for ${packageId.id}@${packageId.version}`);
-        return { name: packageId.id, version: packageId.version };
+        this.logger.warn(`Could not find package manifest for ${packageObj.id}${packageObj.version ? '@' + packageObj.version : ''}`);
+        return { name: packageObj.id, version: packageObj.version || 'unknown' };
       }
     } catch (e) {
       throw this.prethrow(e);
@@ -692,7 +860,7 @@ export class FhirPackageInstaller {
    * Get the logger instance used by this FhirPackageInstaller.
   */
 
-  public getLogger(): ILogger {
+  public getLogger(): Logger {
     return this.logger;
   }
 
@@ -721,6 +889,59 @@ export class FhirPackageInstaller {
     }
   }
 
+  private sanitizeImplicitLatestCacheFileName(packageName: string): string {
+    // Package names should be safe, but ensure no path traversal / illegal characters.
+    // Keep dots to match requested format; replace path separators and Windows-illegal chars.
+    return packageName.replace(/[\\/]/g, '_').replace(/[<>:"|?*]/g, '_');
+  }
+
+  private getImplicitLatestVersionCacheFilePath(packageName: string): string {
+    const safeName = this.sanitizeImplicitLatestCacheFileName(packageName);
+    return path.join(this.cachePath, `.fpi.latest.${safeName}`);
+  }
+
+  private async readImplicitLatestVersionFromDisk(packageName: string): Promise<string | null> {
+    try {
+      const cacheFilePath = this.getImplicitLatestVersionCacheFilePath(packageName);
+      if (!await fs.exists(cacheFilePath)) {
+        return null;
+      }
+
+      const cacheData = await fs.readJSON(cacheFilePath, { encoding: 'utf8' });
+      const version = cacheData?.version;
+      const expiresAt = cacheData?.expiresAt;
+      if (typeof version !== 'string' || version.trim().length === 0) {
+        return null;
+      }
+      if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
+        return null;
+      }
+      if (Date.now() >= expiresAt) {
+        return null;
+      }
+
+      return version;
+    } catch {
+      // Ignore corrupted cache files; we'll fall back to online lookup.
+      return null;
+    }
+  }
+
+  private async writeImplicitLatestVersionToDisk(packageName: string, version: string): Promise<void> {
+    const cacheFilePath = this.getImplicitLatestVersionCacheFilePath(packageName);
+    const expiresAt = Date.now() + IMPLICIT_LATEST_VERSION_TTL_MS;
+
+    // Ensure cache root exists (it may not, if only getDependencies() is used).
+    await fs.ensureDir(this.cachePath);
+
+    // Best-effort write; don't fail installs if we can't persist the cache.
+    try {
+      await fs.writeJSON(cacheFilePath, { version, expiresAt });
+    } catch {
+      // ignore
+    }
+  }
+
   /**
    * Resolve the latest version for an implicit package dependency
    * Tries online registry first, then falls back to latest cached version
@@ -728,9 +949,17 @@ export class FhirPackageInstaller {
    * @returns Resolved version or throws if no version found
    */
   private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
-    // First try to get the latest version from registry (using existing cache)
+    // Prefer a shared (disk) cache so multiple FPI instances can avoid repeated registry calls.
+    const diskCached = await this.readImplicitLatestVersionFromDisk(packageName);
+    if (diskCached) {
+      this.latestVersionCache.set(packageName, diskCached);
+      return diskCached;
+    }
+
+    // Next try to get the latest version from registry (using existing in-memory cache)
     try {
       const latest = await this.checkLatestPackageDist(packageName);
+      await this.writeImplicitLatestVersionToDisk(packageName, latest);
       return latest;
     } catch (onlineError: any) {
       this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
@@ -746,6 +975,9 @@ export class FhirPackageInstaller {
       
       // Update the cache with this fallback version so other operations can reuse it
       this.latestVersionCache.set(packageName, latestCached);
+
+      // Also update the shared (disk) cache so other instances can reuse it.
+      await this.writeImplicitLatestVersionToDisk(packageName, latestCached);
       
       return latestCached;
     }
@@ -756,7 +988,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package to check for implicit dependencies
    * @returns Promise resolving to record of implicit dependencies
    */
-  private async getImplicitDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+  private async getImplicitDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     const implicitDeps: Record<string, string> = {};
     
     // Prevent recursion - if we're already resolving implicit deps for this package, return empty
@@ -799,7 +1031,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package to get explicit dependencies for
    * @returns Promise resolving to record of explicit dependencies only
    */
-  private async getExplicitDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+  private async getExplicitDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     try {
       const deps = (await this.getManifest(packageObject))?.dependencies || {};
       // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
@@ -822,7 +1054,7 @@ export class FhirPackageInstaller {
    * @param packageObject The package to get dependencies for
    * @returns Promise resolving to record of all dependencies (explicit + implicit)
    */
-  public async getDependencies(packageObject: PackageIdentifier): Promise<Record<string, string>> {
+  public async getDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     try {
       // Get explicit dependencies from package.json
       const explicitDeps = await this.getExplicitDependencies(packageObject);
@@ -837,9 +1069,9 @@ export class FhirPackageInstaller {
     }
   }
 
-  public async install(packageId: string | PackageIdentifier): Promise<boolean> {
+  public async install(packageId: string | FhirPackageIdentifier): Promise<boolean> {
     try {
-      let packageObject: PackageIdentifier;
+      let packageObject: FhirPackageIdentifier;
       if (typeof packageId === 'string') {
         packageId = packageId.trim();
         if (packageId.length === 0) {
@@ -882,7 +1114,7 @@ export class FhirPackageInstaller {
     }
   }
 
-  private async installPackageDependencies(packageObject: PackageIdentifier): Promise<void>{
+  private async installPackageDependencies(packageObject: FhirPackageIdentifier): Promise<void>{
     await this.getPackageIndexFile(packageObject);
     
     // Get all dependencies (explicit + implicit) using the updated getDependencies method
@@ -927,7 +1159,7 @@ export class FhirPackageInstaller {
         finalPath = await this.extractTarball(fullPath);
       }
     
-      let packageObject: PackageIdentifier;
+      let packageObject: FhirPackageIdentifier;
       if (options?.packageId) {
         packageObject = await this.toPackageObject(options.packageId);
       } else {
@@ -966,14 +1198,14 @@ export class FhirPackageInstaller {
    * - If `extract` is false or omitted: downloads the tarball as a .tgz file to the destination directory.
    * - If `extract` is true: downloads and extracts the package into a subdirectory of the destination path.
    *
-   * @param packageId A package identifier string or a PackageIdentifier object.
+   * @param packageId A package identifier string or a FhirPackageIdentifier object.
    * @param options Options controlling the download and extraction behavior.
    * @returns 
    * - If `extract` is false: the full path to the downloaded tarball file.
    * - If `extract` is true: the full path to the extracted package directory.
    */
   public async downloadPackage(
-    packageId: string | PackageIdentifier,
+    packageId: string | FhirPackageIdentifier,
     options?: DownloadPackageOptions): Promise<string> 
   {
     try {
@@ -1020,11 +1252,6 @@ const fpi = new FhirPackageInstaller();
 export default fpi;
 
 export type {
-  ILogger,
-  PackageIdentifier,
-  PackageIndex,
-  PackageManifest,
-  FileInPackageIndex,
   PackageResource,
   DownloadPackageOptions,
   InstallPackageOptions,
@@ -1032,4 +1259,11 @@ export type {
   ILatestVersionCache
 } from './types';
 
+export type {
+  PackageIndex,
+  PackageManifest,
+  FileInPackageIndex
+} from '@outburn/types';
+
 export { MemoryLatestVersionCache } from './types';
+

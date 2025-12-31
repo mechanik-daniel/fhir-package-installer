@@ -2,9 +2,9 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import fs from 'fs-extra';
 import { FhirPackageInstaller, MemoryLatestVersionCache } from 'fhir-package-installer';
-import type { ILogger } from 'fhir-package-installer';
+import type { Logger } from '@outburn/types';
 
-const noopLogger: ILogger = {
+const noopLogger: Logger = {
   info: () => {},
   warn: () => {},
   error: () => {},

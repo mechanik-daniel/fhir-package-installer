@@ -3,7 +3,7 @@
  *   Project name: FHIR-Package-Installer
  */
 
-import { PackageIdentifier } from './PackageIdentifier';
+import { FhirPackageIdentifier } from '@outburn/types';
 
 /**
  * Options for installing a package.
@@ -12,7 +12,7 @@ import { PackageIdentifier } from './PackageIdentifier';
  * @param installDependencies Whether to install dependencies of the package. Defaults to false.
  */
 export interface InstallPackageOptions {
-    packageId?: string | PackageIdentifier,
+    packageId?: string | FhirPackageIdentifier,
     override?: boolean,
     installDependencies?: boolean,
   }

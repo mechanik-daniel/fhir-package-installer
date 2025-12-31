@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { FhirPackageInstaller } from 'fhir-package-installer';
-import { MemoryLatestVersionCache, type ILatestVersionCache, type ILogger } from 'fhir-package-installer';
+import { MemoryLatestVersionCache, type ILatestVersionCache } from 'fhir-package-installer';
+import type { Logger } from '@outburn/types';
 
 describe('FHIR Package Latest Version Caching', () => {
   let fpi: FhirPackageInstaller;
   let cache: ILatestVersionCache;
-  let mockLogger: ILogger;
+  let mockLogger: Logger;
   
   // Mock logger that captures log calls for assertions
   beforeEach(() => {

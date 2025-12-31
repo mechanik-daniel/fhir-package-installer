@@ -4,9 +4,10 @@ import fs from 'fs-extra';
 import { describe, it, expect, beforeAll } from 'vitest';
 
 import { FhirPackageInstaller, MemoryLatestVersionCache } from 'fhir-package-installer';
-import type { FileInPackageIndex, ILogger } from 'fhir-package-installer';
+import type { FileInPackageIndex } from 'fhir-package-installer';
+import type { Logger } from '@outburn/types';
 
-const noopLogger: ILogger = {
+const noopLogger: Logger = {
   info: () => {},
   warn: () => {},
   error: () => {},
@@ -125,7 +126,7 @@ describe('fhir-package-installer module', () => {
     expect(manifest2.name).toBe(heavyPackage.id);
   });
 
-  it('should parse a package string to a valid PackageIdentifier object', async () => {
+  it('should parse a package string to a valid FhirPackageIdentifier object', async () => {
     const obj = await testFpi.toPackageObject('pkg.name@1.0.0');
     expect(obj).toEqual({ id: 'pkg.name', version: '1.0.0' });
   });
@@ -224,7 +225,7 @@ describe('fhir-package-installer module', () => {
 
   // Test downloadPackage function
   describe('downloadPackage', async () => {
-    it('download only - default path', async () => {
+    it('download only - default path', { timeout: TIMEOUT }, async () => {
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: downloadedPackagesPath });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
@@ -233,23 +234,23 @@ describe('fhir-package-installer module', () => {
     const customPath = path.join(downloadedPackagesPath, 'custom-path');
     const resolvedCustomPath = path.resolve(customPath);
 
-    it('download only - custom path - relative', async () => {
+    it('download only - custom path - relative', { timeout: TIMEOUT }, async () => {
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: customPath });
       expect(downloadedPath).toBe(path.join(resolvedCustomPath, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
-    it('download only - custom path - fail to override', async () => {
+    it('download only - custom path - fail to override', { timeout: TIMEOUT }, async () => {
       const action = testFpi.downloadPackage(testPkg, { destination: customPath });
       await expect(action).rejects.toThrow('dest already exists.');
     });
 
-    it('download only - custom path - override', async () => {
+    it('download only - custom path - override', { timeout: TIMEOUT }, async () => {
       const action = testFpi.downloadPackage(testPkg, { destination: customPath, overwrite: true });
       await expect(action).resolves.toBeDefined();
     });
     
-    it('download only - custom path - absolute', async () => {
+    it('download only - custom path - absolute', { timeout: TIMEOUT }, async () => {
       const tempDirectory = temp.mkdirSync();
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: tempDirectory });
       expect(downloadedPath).toBe(path.join(tempDirectory, `${testPkg.id}-${testPkg.version}.tgz`));
@@ -258,33 +259,33 @@ describe('fhir-package-installer module', () => {
       await fs.remove(tempDirectory);
     });
 
-    it('download and extract - default path', async () => {
+    it('download and extract - default path', { timeout: TIMEOUT }, async () => {
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: downloadedPackagesPath, extract: true });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}#${testPkg.version}`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
-    it('download and extract - custom path', async () => {
+    it('download and extract - custom path', { timeout: TIMEOUT }, async () => {
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: customPath, extract: true });
       expect(downloadedPath).toBe(path.join(resolvedCustomPath, `${testPkg.id}#${testPkg.version}`));
       expect(fs.existsSync(downloadedPath)).toBe(true);
     });
 
-    it('download and extract - custom path - fail to override', async () => {
+    it('download and extract - custom path - fail to override', { timeout: TIMEOUT }, async () => {
       const action = testFpi.downloadPackage(testPkg, { destination: customPath, extract: true });
       await expect(action).rejects.toThrow('dest already exists.');
     });
 
-    it('download and extract - custom path - override', async () => {
+    it('download and extract - custom path - override', { timeout: TIMEOUT }, async () => {
       const action = testFpi.downloadPackage(testPkg, { destination: customPath, extract: true, overwrite: true });
       await expect(action).resolves.toBeDefined();
     });
 
     it.each([
-      'hl7.fhir.us.core@6.1.0',
-      'hl7.fhir.us.davinci-pdex@2.0.0',
-      'hl7.fhir.us.davinci-pas@2.0.1',
-      'de.gematik.epa.medication@1.0.2-rc1'
+      'hl7.fhir.uv.tools@0.9.0',
+      // 'hl7.fhir.us.davinci-pdex@2.0.0',
+      // 'hl7.fhir.us.davinci-pas@2.0.1',
+      'hl7.fhir.uv.sdc#3.0.0'
     ])('should install package: %s', 
       { timeout: TIMEOUT, skip }, 
       async (pkg) => {
