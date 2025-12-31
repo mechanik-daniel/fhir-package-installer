@@ -142,7 +142,7 @@ Looks up the latest published version for a given package name (string only).
 
 ---
 
-### `toPackageObject(packageId: string | FhirPackageIdentifier): Promise<PackageIdentifier>`
+### `toPackageObject(packageId: string | FhirPackageIdentifier): Promise<FhirPackageIdentifier>`
 Parses `name`, `name@version`, or `name#version` into an object with `id` and `version`.  
 If no version is provided, resolves to the latest.
 
