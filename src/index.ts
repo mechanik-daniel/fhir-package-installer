@@ -16,7 +16,7 @@ import * as zlib from 'zlib';
 import temp from 'temp';
 import os from 'os';
 import semver from 'semver';
-import shallowParse from './shallowParse';
+ 
 
 import type {
   FileInPackageIndex,
@@ -240,8 +240,9 @@ export class FhirPackageInstaller {
       ).map(
         file => limit(
           async () => {
-            const content = shallowParse(await fs.readFile(path.join(packagePath, 'package', file), { encoding: 'utf8' }));
-            const indexEntry = extractResourceIndexEntry(file, content as PackageResource);
+            const contentText = await fs.readFile(path.join(packagePath, 'package', file), { encoding: 'utf8' });
+            const content = JSON.parse(contentText) as PackageResource;
+            const indexEntry = extractResourceIndexEntry(file, content);
             return indexEntry;
           }
         )
@@ -593,7 +594,7 @@ export class FhirPackageInstaller {
                 limit(async () => {
                   const contentBuffer = await fs.readFile(fullPath, 'utf8');
                   try {
-                    const content = shallowParse(contentBuffer) as PackageResource;
+                    const content = JSON.parse(contentBuffer) as PackageResource;
                     const indexEntry = extractResourceIndexEntry(fileName, content);
                     indexEntries.push(indexEntry);
                   } catch (err) {
