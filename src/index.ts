@@ -671,8 +671,20 @@ export class FhirPackageInstaller {
   private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const tarballUrl = await this.getTarballUrl(packageObject);
     this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
-    const tarballStream = await this.fetchStream(tarballUrl);
-    return await this.extractTarball(tarballStream);
+    return await this.withRetries(async () => {
+      const tarballStream = await this.fetchStream(tarballUrl);
+      try {
+        return await this.extractTarball(tarballStream);
+      } catch (err) {
+        // Ensure the request stream is torn down between retries.
+        try {
+          tarballStream.destroy();
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
+    });
   }
 
   /**
