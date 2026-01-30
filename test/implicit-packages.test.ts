@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import fs from 'fs-extra';
-import { FhirPackageInstaller, MemoryLatestVersionCache } from 'fhir-package-installer';
+import { FhirPackageInstaller } from 'fhir-package-installer';
 import type { Logger } from '@outburn/types';
 
 const noopLogger: Logger = {
@@ -9,9 +9,6 @@ const noopLogger: Logger = {
   warn: () => {},
   error: () => {},
 };
-
-// Create a shared FHIR package latest version cache to prevent multiple registry calls during tests
-const sharedCache = new MemoryLatestVersionCache();
 
 const TIMEOUT = 240000; // 240 seconds timeout for installation
 
@@ -21,7 +18,6 @@ describe('Implicit Packages Feature', () => {
   const testFpi = new FhirPackageInstaller({
     cachePath: customCachePath,
     skipExamples: true,
-    latestVersionCache: sharedCache,
     logger: noopLogger
   });
 
@@ -120,7 +116,6 @@ describe('Implicit Packages Feature', () => {
         registryUrl: 'https://invalid-registry-url.example.com',
         cachePath: customCachePath,
         skipExamples: true,
-        latestVersionCache: new MemoryLatestVersionCache(), // Don't use shared cache
         logger: noopLogger
       });
       

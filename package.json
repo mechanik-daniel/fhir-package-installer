@@ -1,6 +1,6 @@
 {
   "name": "fhir-package-installer",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "A utility module for downloading, indexing, caching, and managing FHIR packages from the FHIR Package Registry and Simplifier",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -78,7 +78,7 @@
     "tslib": "^2.8.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.53.0",
+    "typescript-eslint": "^8.54.0",
     "vitest": "^3.2.4"
   }
 }

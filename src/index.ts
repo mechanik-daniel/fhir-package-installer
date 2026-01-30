@@ -28,11 +28,8 @@ import type {
   FpiConfig,
   PackageResource,
   DownloadPackageOptions,
-  InstallPackageOptions,
-  ILatestVersionCache
+  InstallPackageOptions
 } from './types';
-
-import { MemoryLatestVersionCache } from './types';
 import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
 temp.track();
@@ -56,7 +53,7 @@ const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
   ]
 };
 
-const IMPLICIT_LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /**
  * Default logger is a no-op.
@@ -116,7 +113,6 @@ export class FhirPackageInstaller {
   private cachePath: string = path.join(os.homedir(), '.fhir', 'packages');
   private skipExamples = false; // skip dependency installation of example packages
   private allowHttp = false; // allow HTTP URLs for testing
-  private latestVersionCache: ILatestVersionCache;
   private resolvingImplicitDeps = new Set<string>();
   private installingPackages = new Set<string>();
   
@@ -128,7 +124,6 @@ export class FhirPackageInstaller {
       cachePath,
       skipExamples,
       allowHttp,
-      latestVersionCache,
       requestTimeoutMs,
       extractTimeoutMs
     } = config || {} as FpiConfig;
@@ -157,9 +152,6 @@ export class FhirPackageInstaller {
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
-    
-    // Initialize latest version cache (use provided one or create new default)
-    this.latestVersionCache = latestVersionCache || new MemoryLatestVersionCache();
   }
 
   private async withRetries<T>(
@@ -743,10 +735,10 @@ export class FhirPackageInstaller {
   }
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
-    // Check cache first
-    const cachedVersion = this.latestVersionCache.get(packageName);
-    if (cachedVersion) {
-      return cachedVersion;
+    // Prefer a shared (disk) cache so multiple FPI instances/processes can avoid repeated registry calls.
+    const diskCached = await this.readLatestVersionFromDisk(packageName);
+    if (diskCached) {
+      return diskCached;
     }
 
     // Cache miss, fetch from registry
@@ -757,8 +749,8 @@ export class FhirPackageInstaller {
       throw new Error(`Package ${packageName} not found or has no latest version tag`);
     }
     
-    // Store in cache
-    this.latestVersionCache.set(packageName, latest);
+    // Store in shared (disk) cache
+    await this.writeLatestVersionToDisk(packageName, latest);
     return latest;
   }
 
@@ -843,20 +835,20 @@ export class FhirPackageInstaller {
     }
   }
 
-  private sanitizeImplicitLatestCacheFileName(packageName: string): string {
+  private sanitizeLatestCacheFileName(packageName: string): string {
     // Package names should be safe, but ensure no path traversal / illegal characters.
     // Keep dots to match requested format; replace path separators and Windows-illegal chars.
     return packageName.replace(/[\\/]/g, '_').replace(/[<>:"|?*]/g, '_');
   }
 
-  private getImplicitLatestVersionCacheFilePath(packageName: string): string {
-    const safeName = this.sanitizeImplicitLatestCacheFileName(packageName);
+  private getLatestVersionCacheFilePath(packageName: string): string {
+    const safeName = this.sanitizeLatestCacheFileName(packageName);
     return path.join(this.cachePath, `.fpi.latest.${safeName}`);
   }
 
-  private async readImplicitLatestVersionFromDisk(packageName: string): Promise<string | null> {
+  private async readLatestVersionFromDisk(packageName: string): Promise<string | null> {
     try {
-      const cacheFilePath = this.getImplicitLatestVersionCacheFilePath(packageName);
+      const cacheFilePath = this.getLatestVersionCacheFilePath(packageName);
       if (!await fs.exists(cacheFilePath)) {
         return null;
       }
@@ -881,16 +873,18 @@ export class FhirPackageInstaller {
     }
   }
 
-  private async writeImplicitLatestVersionToDisk(packageName: string, version: string): Promise<void> {
-    const cacheFilePath = this.getImplicitLatestVersionCacheFilePath(packageName);
-    const expiresAt = Date.now() + IMPLICIT_LATEST_VERSION_TTL_MS;
+  private async writeLatestVersionToDisk(packageName: string, version: string): Promise<void> {
+    const cacheFilePath = this.getLatestVersionCacheFilePath(packageName);
+    const expiresAt = Date.now() + LATEST_VERSION_TTL_MS;
 
     // Ensure cache root exists (it may not, if only getDependencies() is used).
     await fs.ensureDir(this.cachePath);
 
     // Best-effort write; don't fail installs if we can't persist the cache.
     try {
-      await fs.writeJSON(cacheFilePath, { version, expiresAt });
+      const tempFilePath = `${cacheFilePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeJSON(tempFilePath, { version, expiresAt });
+      await fs.move(tempFilePath, cacheFilePath, { overwrite: true });
     } catch {
       // ignore
     }
@@ -903,18 +897,9 @@ export class FhirPackageInstaller {
    * @returns Resolved version or throws if no version found
    */
   private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
-    // Prefer a shared (disk) cache so multiple FPI instances can avoid repeated registry calls.
-    const diskCached = await this.readImplicitLatestVersionFromDisk(packageName);
-    if (diskCached) {
-      this.latestVersionCache.set(packageName, diskCached);
-      return diskCached;
-    }
-
-    // Next try to get the latest version from registry (using existing in-memory cache)
+    // Online-first (with shared disk cache), fallback to installed versions if registry is unavailable.
     try {
-      const latest = await this.checkLatestPackageDist(packageName);
-      await this.writeImplicitLatestVersionToDisk(packageName, latest);
-      return latest;
+      return await this.checkLatestPackageDist(packageName);
     } catch (onlineError: any) {
       this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
       
@@ -926,12 +911,9 @@ export class FhirPackageInstaller {
       
       const latestCached = installedVersions[0]; // Already sorted with latest first
       this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
-      
-      // Update the cache with this fallback version so other operations can reuse it
-      this.latestVersionCache.set(packageName, latestCached);
 
-      // Also update the shared (disk) cache so other instances can reuse it.
-      await this.writeImplicitLatestVersionToDisk(packageName, latestCached);
+      // Update shared (disk) cache so other instances can reuse it.
+      await this.writeLatestVersionToDisk(packageName, latestCached);
       
       return latestCached;
     }
@@ -1177,8 +1159,7 @@ export type {
   PackageResource,
   DownloadPackageOptions,
   InstallPackageOptions,
-  FpiConfig,
-  ILatestVersionCache
+  FpiConfig
 } from './types';
 
 export type {
@@ -1186,6 +1167,4 @@ export type {
   PackageManifest,
   FileInPackageIndex
 } from '@outburn/types';
-
-export { MemoryLatestVersionCache } from './types';
 

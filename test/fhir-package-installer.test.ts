@@ -3,7 +3,7 @@ import temp from 'temp';
 import fs from 'fs-extra';
 import { describe, it, expect, beforeAll } from 'vitest';
 
-import { FhirPackageInstaller, MemoryLatestVersionCache } from 'fhir-package-installer';
+import { FhirPackageInstaller } from 'fhir-package-installer';
 import type { FileInPackageIndex } from 'fhir-package-installer';
 import type { Logger } from '@outburn/types';
 
@@ -35,24 +35,16 @@ describe('fhir-package-installer module', () => {
   
   const heavyPackage = { id: 'us.nlm.vsac', version: '0.11.0' };
 
-  // Create a shared FHIR package latest version cache to prevent multiple registry calls during tests
-  const sharedCache = new MemoryLatestVersionCache();
-  
   const silentFpi = new FhirPackageInstaller({ 
-    logger: noopLogger,
-    latestVersionCache: sharedCache
+    logger: noopLogger
   });
   const customCachePath = path.join(path.resolve('.'), 'test', '.test-cache');
   const customCacheFpi = new FhirPackageInstaller({
     cachePath: customCachePath,
-    skipExamples: true,
-    latestVersionCache: sharedCache
+    skipExamples: true
   });
 
-  // Create a test instance that also uses shared cache for default cache path tests
-  const testFpi = new FhirPackageInstaller({
-    latestVersionCache: sharedCache
-  });
+  const testFpi = new FhirPackageInstaller();
 
   const downloadedPackagesPath = path.join('.', 'test', 'downloaded-packages');
   const resolvedDownloadedPackagesPath = path.resolve(downloadedPackagesPath);
@@ -90,7 +82,8 @@ describe('fhir-package-installer module', () => {
   });
 
   it('should correctly detect latest available version of test package', async () => {
-    const latest = await testFpi.checkLatestPackageDist(testPkg.id);
+    // Use the custom-cache instance to keep disk cache writes inside test workspace.
+    const latest = await customCacheFpi.checkLatestPackageDist(testPkg.id);
     expect(latest).toBe(testPkg.version);
   });
 
