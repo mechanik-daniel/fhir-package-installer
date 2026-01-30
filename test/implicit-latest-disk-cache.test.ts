@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import fs from 'fs-extra';
-import { FhirPackageInstaller, MemoryLatestVersionCache } from '../src/index';
+import { FhirPackageInstaller } from '../src/index';
 import type { Logger } from '@outburn/types';
 
 const noopLogger: Logger = {
@@ -28,7 +28,6 @@ describe('Implicit latest version disk cache', () => {
     const fpi1 = new FhirPackageInstaller({
       cachePath,
       logger: noopLogger,
-      latestVersionCache: new MemoryLatestVersionCache(),
     });
 
     const fpi1Implicit = fpi1 as unknown as {
@@ -56,7 +55,6 @@ describe('Implicit latest version disk cache', () => {
     const fpi2 = new FhirPackageInstaller({
       cachePath,
       logger: noopLogger,
-      latestVersionCache: new MemoryLatestVersionCache(),
     });
 
     const fpi2Implicit = fpi2 as unknown as {
@@ -82,7 +80,6 @@ describe('Implicit latest version disk cache', () => {
     const fpi = new FhirPackageInstaller({
       cachePath,
       logger: noopLogger,
-      latestVersionCache: new MemoryLatestVersionCache(),
     });
 
     const fpiImplicit = fpi as unknown as {
