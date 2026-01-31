@@ -16,6 +16,7 @@ import * as zlib from 'zlib';
 import temp from 'temp';
 import os from 'os';
 import semver from 'semver';
+import crypto from 'crypto';
  
 
 import type {
@@ -33,6 +34,18 @@ import type {
 import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
 temp.track();
+
+// NOTE: This is injected at build time via tsup `define` (see tsup.config.ts).
+// It must NOT be read from package.json at runtime (supports SEA/bundling scenarios).
+declare const __FPI_VERSION__: string | undefined;
+const FPI_VERSION = typeof __FPI_VERSION__ === 'string' && __FPI_VERSION__.trim().length > 0
+  ? __FPI_VERSION__
+  : '0.0.0';
+const FPI_INDEX_CACHE_VERSION = (() => {
+  const v = semver.parse(FPI_VERSION);
+  if (!v) return '0.0';
+  return `${v.major}.${v.minor}`;
+})();
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
