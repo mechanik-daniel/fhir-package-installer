@@ -101,6 +101,7 @@ const extractResourceIndexEntry = (filename: string, content: PackageResource): 
 export class FhirPackageInstaller {
   private logger: Logger = defaultLogger;
   private registryUrl = 'https://packages.fhir.org';
+  private registryDisabled = false;
   private registryToken?: string; // optional token for private registries
   private fallbackUrlBase = 'https://packages.simplifier.net';
   private requestTimeoutMs = 90000; // 90 seconds
@@ -128,7 +129,13 @@ export class FhirPackageInstaller {
       extractTimeoutMs
     } = config || {} as FpiConfig;
     if (registryUrl) {
-      this.registryUrl = registryUrl;
+      const normalized = registryUrl.trim().toLowerCase();
+      if (normalized === 'n/a') {
+        this.registryDisabled = true;
+        this.registryUrl = registryUrl;
+      } else {
+        this.registryUrl = registryUrl;
+      }
     }
     if (registryToken) {
       this.registryToken = registryToken;
@@ -152,6 +159,45 @@ export class FhirPackageInstaller {
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
+  }
+
+  private isRegistryDisabled(): boolean {
+    return this.registryDisabled;
+  }
+
+  private formatRegistryDisabledMessage(detail: string): string {
+    return `FHIR package registry is disabled (registryUrl=n/a). ${detail}`;
+  }
+
+  private async packageManifestExists(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    const packageDir = await this.getPackageDirPath(packageObject);
+    return await fs.exists(path.join(packageDir, 'package', 'package.json'));
+  }
+
+  private async collectMissingPackages(root: FhirPackageIdentifier): Promise<string[]> {
+    const missing: string[] = [];
+    const visited = new Set<string>();
+
+    const visit = async (pkg: FhirPackageIdentifier) => {
+      const key = `${pkg.id}#${pkg.version}`;
+      if (visited.has(key)) return;
+      visited.add(key);
+
+      const hasManifest = await this.packageManifestExists(pkg);
+      if (!hasManifest) {
+        missing.push(key);
+        return;
+      }
+
+      const deps = await this.getDependencies(pkg);
+      for (const [depId, depVersion] of Object.entries(deps || {})) {
+        if (this.skipExamples && depId.includes('examples')) continue;
+        await visit({ id: depId, version: depVersion });
+      }
+    };
+
+    await visit(root);
+    return missing;
   }
 
   private async withRetries<T>(
@@ -258,14 +304,17 @@ export class FhirPackageInstaller {
     
     // Add authorization header for requests to the configured registry
     // or any URL that contains the same hostname (to handle redirects within the same registry)
-    if (this.registryToken) {
-      const registryHostname = new URL(this.registryUrl).hostname;
-      const urlHostname = new URL(url).hostname;
-      
-      if (url.startsWith(this.registryUrl) || urlHostname === registryHostname) {
-        options.headers = {
-          'Authorization': `Bearer ${this.registryToken}`
-        };
+    if (this.registryToken && !this.isRegistryDisabled()) {
+      try {
+        const registryHostname = new URL(this.registryUrl).hostname;
+        const urlHostname = new URL(url).hostname;
+        if (url.startsWith(this.registryUrl) || urlHostname === registryHostname) {
+          options.headers = {
+            'Authorization': `Bearer ${this.registryToken}`
+          };
+        }
+      } catch {
+        // If registryUrl isn't a valid URL (e.g., registryUrl='n/a'), skip auth headers.
       }
     }
     
@@ -415,10 +464,18 @@ export class FhirPackageInstaller {
   }  
 
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
+    if (this.isRegistryDisabled()) {
+      throw new Error(this.formatRegistryDisabledMessage(`Cannot query registry for package metadata (${packageName}).`));
+    }
     return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
   }
 
   private async getTarballUrl(packageObject: FhirPackageIdentifier): Promise<string> {
+    if (this.isRegistryDisabled()) {
+      throw new Error(this.formatRegistryDisabledMessage(
+        `Cannot download ${packageObject.id}@${packageObject.version}. Required packages must already exist in the package cache (${this.cachePath}).`
+      ));
+    }
     const isPrivateRegistry = this.registryUrl !== 'https://packages.fhir.org';
     
     // Always fetch package metadata for validation and version information
@@ -722,8 +779,45 @@ export class FhirPackageInstaller {
     return 'latest';
   }
 
-  public async isInstalled(packageId: FhirPackageIdentifier | string): Promise<boolean> {
-    return await fs.exists(await this.getPackageDirPath(packageId));
+  public async isInstalled(
+    packageId: FhirPackageIdentifier | string,
+    options?: { deep?: boolean }
+  ): Promise<boolean> {
+    const deep = options?.deep !== false;
+
+    // Avoid resolving "latest" via registry for unversioned string checks.
+    if (typeof packageId === 'string') {
+      const packageIdStr = packageId.trim();
+      if (packageIdStr.length === 0) {
+        return false;
+      }
+      const hasExplicitVersion = packageIdStr.includes('#') || packageIdStr.includes('@');
+      if (!hasExplicitVersion) {
+        const installedVersions = await this.getInstalledVersions(packageIdStr);
+        if (installedVersions.length === 0) return false;
+        const latestInstalled = installedVersions[0];
+        return await this.isInstalled({ id: packageIdStr, version: latestInstalled }, { deep });
+      }
+    }
+
+    const packageObject = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    const dirPath = await this.getPackageDirPath(packageObject);
+    if (!await fs.exists(dirPath)) {
+      return false;
+    }
+    if (!await this.packageManifestExists(packageObject)) {
+      return false;
+    }
+    if (!deep) {
+      return true;
+    }
+
+    try {
+      const missing = await this.collectMissingPackages(packageObject);
+      return missing.length === 0;
+    } catch {
+      return false;
+    }
   }
 
   public async getPackageIndexFile(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
@@ -735,23 +829,46 @@ export class FhirPackageInstaller {
   }
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
+    if (this.isRegistryDisabled()) {
+      throw new Error(this.formatRegistryDisabledMessage(
+        `Cannot resolve latest version for ${packageName}. Pin an explicit version in configuration.`
+      ));
+    }
+
     // Prefer a shared (disk) cache so multiple FPI instances/processes can avoid repeated registry calls.
     const diskCached = await this.readLatestVersionFromDisk(packageName);
     if (diskCached) {
       return diskCached;
     }
 
-    // Cache miss, fetch from registry
-    this.logger.info(`Fetching latest version for FHIR package ${packageName} from registry`);
-    const packageData = await this.getPackageDataFromRegistry(packageName);
-    const latest = packageData['dist-tags']?.latest;
-    if (!latest) {
-      throw new Error(`Package ${packageName} not found or has no latest version tag`);
+    // Cache miss, fetch from registry (retry inside fetchJson), fallback to latest installed version.
+    try {
+      this.logger.info(`Fetching latest version for FHIR package ${packageName} from registry`);
+      const packageData = await this.getPackageDataFromRegistry(packageName);
+      const latest = packageData['dist-tags']?.latest;
+      if (!latest) {
+        throw new Error(`Package ${packageName} not found or has no latest version tag`);
+      }
+      await this.writeLatestVersionToDisk(packageName, latest);
+      return latest;
+    } catch (onlineError: any) {
+      this.logger.warn(
+        `Failed to fetch latest version for ${packageName} from registry: ${onlineError?.message || onlineError}`
+      );
+
+      const installedVersions = await this.getInstalledVersions(packageName);
+      if (installedVersions.length === 0) {
+        throw new Error(
+          `Failed to resolve latest version for ${packageName} from registry (${onlineError?.message || onlineError}). ` +
+          `No installed versions found in cache (${this.cachePath}).`
+        );
+      }
+
+      const latestInstalled = installedVersions[0];
+      this.logger.warn(`Using latest installed version for ${packageName}: ${latestInstalled}`);
+      await this.writeLatestVersionToDisk(packageName, latestInstalled);
+      return latestInstalled;
     }
-    
-    // Store in shared (disk) cache
-    await this.writeLatestVersionToDisk(packageName, latest);
-    return latest;
   }
 
   public async toPackageObject(packageId: string | FhirPackageIdentifier): Promise<FhirPackageIdentifier> {
@@ -769,6 +886,11 @@ export class FhirPackageInstaller {
       packageVersion = packageId.version || 'latest';
     }
     if (packageVersion === 'latest') {
+      if (this.isRegistryDisabled()) {
+        throw new Error(this.formatRegistryDisabledMessage(
+          `Cannot use the "latest" version feature for ${packageName}. Pin an explicit version (e.g., ${packageName}@x.y.z).`
+        ));
+      }
       packageVersion = await this.checkLatestPackageDist(packageName);
     }
     return { id: packageName, version: packageVersion };
@@ -897,24 +1019,40 @@ export class FhirPackageInstaller {
    * @returns Resolved version or throws if no version found
    */
   private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
+    // Implicit packages are always "latest". If registry is disabled/offline, fall back to latest installed.
+    if (this.isRegistryDisabled()) {
+      this.logger.warn(
+        `Registry disabled; using latest installed version for implicit package ${packageName} (if available)`
+      );
+      const installedVersions = await this.getInstalledVersions(packageName);
+      if (installedVersions.length === 0) {
+        throw new Error(
+          `No version of implicit package ${packageName} found in cache (${this.cachePath}). Cannot start without a registry.`
+        );
+      }
+      const latestCached = installedVersions[0];
+      await this.writeLatestVersionToDisk(packageName, latestCached);
+      return latestCached;
+    }
+
     // Online-first (with shared disk cache), fallback to installed versions if registry is unavailable.
     try {
       return await this.checkLatestPackageDist(packageName);
     } catch (onlineError: any) {
-      this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
-      
-      // Fallback to latest cached version
+      this.logger.warn(
+        `Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`
+      );
+
       const installedVersions = await this.getInstalledVersions(packageName);
       if (installedVersions.length === 0) {
-        throw new Error(`No version of implicit package ${packageName} found in cache. Cannot determine version to use.`);
+        throw new Error(
+          `No version of implicit package ${packageName} found in cache (${this.cachePath}). Cannot determine version to use.`
+        );
       }
-      
-      const latestCached = installedVersions[0]; // Already sorted with latest first
-      this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
 
-      // Update shared (disk) cache so other instances can reuse it.
+      const latestCached = installedVersions[0];
+      this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
       await this.writeLatestVersionToDisk(packageName, latestCached);
-      
       return latestCached;
     }
   }
@@ -943,16 +1081,11 @@ export class FhirPackageInstaller {
     this.resolvingImplicitDeps.add(packageKey);
     
     try {
-      
-      // Resolve versions for each implicit dependency
+      // Resolve versions for each implicit dependency.
+      // If any implicit package can't be resolved (and isn't installed), we must fail startup.
       for (const implicitPackageId of implicitPackageIds) {
-        try {
-          const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
-          implicitDeps[implicitPackageId] = version;
-        } catch (e: any) {
-          this.logger.warn(`Failed to resolve implicit dependency ${implicitPackageId}: ${e?.message || e}`);
-          // Continue with other implicit dependencies rather than failing completely
-        }
+        const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
+        implicitDeps[implicitPackageId] = version;
       }
     } finally {
       // Always remove from tracking set
@@ -1008,6 +1141,20 @@ export class FhirPackageInstaller {
     } else {
       packageObject = packageId;
     }
+
+    // Registry disabled mode: never attempt downloads.
+    // All required packages (including transitive + implicit deps) must already exist.
+    if (this.isRegistryDisabled()) {
+      const missing = await this.collectMissingPackages(packageObject);
+      if (missing.length > 0) {
+        const preview = missing.slice(0, 10).join(', ');
+        const suffix = missing.length > 10 ? ` (and ${missing.length - 10} more)` : '';
+        throw new Error(this.formatRegistryDisabledMessage(
+          `Required packages are missing or incomplete in cache (${this.cachePath}). Missing: ${preview}${suffix}`
+        ));
+      }
+      return true;
+    }
     
     // Prevent circular installations
     const packageKey = `${packageObject.id}@${packageObject.version}`;
@@ -1015,8 +1162,13 @@ export class FhirPackageInstaller {
       return true;
     }
     
-    const alreadyInstalled = await this.isInstalled(packageObject);
-    if (!alreadyInstalled) {
+    const installedDeep = await this.isInstalled(packageObject);
+    if (!installedDeep) {
+      const dirPath = await this.getPackageDirPath(packageObject);
+      if (await fs.exists(dirPath)) {
+        // Clean up partial/corrupt installs so we can reinstall cleanly.
+        await fs.remove(dirPath);
+      }
       const tempPath = await this.downloadAndExtractTarball(packageObject);
       await this.cachePackage(packageObject, tempPath);
     }
