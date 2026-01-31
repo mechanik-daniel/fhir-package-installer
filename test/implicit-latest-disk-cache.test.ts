@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import fs from 'fs-extra';
+import crypto from 'crypto';
 import { FhirPackageInstaller } from '../src/index';
 import type { Logger } from '@outburn/types';
 
@@ -12,8 +13,13 @@ const noopLogger: Logger = {
 
 describe('Implicit latest version disk cache', () => {
   const cachePath = path.join(path.resolve('.'), 'test', '.test-cache-implicit-latest-disk');
-  const implicitPackageName = 'hl7.fhir.uv.extensions.r4';
-  const cacheFilePath = path.join(cachePath, `.fpi.latest.${implicitPackageName}`);
+  const registryUrl = 'https://packages.fhir.org';
+
+  const sha256Hex = (value: string): string => crypto.createHash('sha256').update(value).digest('hex');
+  const getRegistryMetadataCacheFilePath = (pkg: string): string => {
+    const key = `registry-meta|${registryUrl}|${pkg}`;
+    return path.join(cachePath, '.fpi.cache', 'metadata', `${sha256Hex(key)}.json`);
+  };
 
   beforeEach(async () => {
     await fs.remove(cachePath);
@@ -24,7 +30,9 @@ describe('Implicit latest version disk cache', () => {
     vi.restoreAllMocks();
   });
 
-  it('should write a shared cache file and allow another instance to reuse it without registry calls', async () => {
+  it('should write a cache file and allow another instance to reuse it without registry calls', async () => {
+    const implicitPackageName = 'hl7.fhir.uv.extensions.r4.testcase.write-reuse';
+    const cacheFilePath = getRegistryMetadataCacheFilePath(implicitPackageName);
     const fpi1 = new FhirPackageInstaller({
       cachePath,
       logger: noopLogger,
@@ -44,12 +52,12 @@ describe('Implicit latest version disk cache', () => {
     expect(v1).toBe('1.2.3');
     expect(mockFetchJson1).toHaveBeenCalledTimes(1);
 
-    // Disk cache file should exist and contain the value + expiry
+    // Disk metadata cache file should exist and contain the value + expiry
     expect(await fs.exists(cacheFilePath)).toBe(true);
     const disk1 = await fs.readJSON(cacheFilePath, { encoding: 'utf8' });
-    expect(disk1).toHaveProperty('version', '1.2.3');
     expect(typeof disk1.expiresAt).toBe('number');
     expect(disk1.expiresAt).toBeGreaterThan(Date.now());
+    expect(disk1.data?.['dist-tags']?.latest).toBe('1.2.3');
 
     // Second instance: if it hits the registry, we fail the test
     const fpi2 = new FhirPackageInstaller({
@@ -71,9 +79,11 @@ describe('Implicit latest version disk cache', () => {
   });
 
   it('should refresh the cache when the on-disk entry is expired', async () => {
-    await fs.ensureDir(cachePath);
+    const implicitPackageName = 'hl7.fhir.uv.extensions.r4.testcase.expired-refresh';
+    const cacheFilePath = getRegistryMetadataCacheFilePath(implicitPackageName);
+    await fs.ensureDir(path.dirname(cacheFilePath));
     await fs.writeJSON(cacheFilePath, {
-      version: '9.9.9',
+      data: { 'dist-tags': { latest: '9.9.9' } },
       expiresAt: Date.now() - 1000, // expired
     });
 
@@ -97,7 +107,7 @@ describe('Implicit latest version disk cache', () => {
     expect(mockFetchJson).toHaveBeenCalledTimes(1);
 
     const disk = await fs.readJSON(cacheFilePath, { encoding: 'utf8' });
-    expect(disk).toHaveProperty('version', '2.3.4');
+    expect(disk.data?.['dist-tags']?.latest).toBe('2.3.4');
     expect(disk.expiresAt).toBeGreaterThan(Date.now());
   });
 });

@@ -1,11 +1,14 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import path from 'path';
 import temp from 'temp';
 import fs from 'fs-extra';
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
 import { FhirPackageInstaller } from 'fhir-package-installer';
 import type { FileInPackageIndex } from 'fhir-package-installer';
 import type { Logger } from '@outburn/types';
+
+import { createLocalRegistryServer, createTgzBuffer } from './local-registry-server';
 
 const noopLogger: Logger = {
   info: () => {},
@@ -20,40 +23,104 @@ function sortIndexEntries(entries: FileInPackageIndex[]): FileInPackageIndex[] {
 
 temp.track();
 
-// Whether to skip specific tests (e.g., heavy package-related tests)
-// to speed up the test suite execution
+// Keep this for quickly toggling a few edge-case tests while iterating locally.
 const skip = false;
 
 const TIMEOUT = 240000; // 240 seconds timeout for installation
 
 describe('fhir-package-installer module', () => {
   const fakePackage = { id: 'fake-package', version: '1.0.0' };
-  const testPkg = { id: 'hl7.fhir.uv.sdc', version: '3.0.0' };
+  const testPkg = { id: 'test.pkg', version: '1.0.0' };
+  const depPkg = { id: 'dep.pkg', version: '1.0.0' };
+  const rootPkg = { id: 'root.pkg', version: '1.0.0' };
   const fshGeneratedPkg = { id: 'fsh.test.pkg', version: '0.1.0' };
   const tstPkgHash = `${testPkg.id}#${testPkg.version}`;
   const tstPkgAt = `${testPkg.id}@${testPkg.version}`;
-  
-  const heavyPackage = { id: 'us.nlm.vsac', version: '0.11.0' };
 
-  const silentFpi = new FhirPackageInstaller({ 
-    logger: noopLogger
-  });
   const customCachePath = path.join(path.resolve('.'), 'test', '.test-cache');
-  const customCacheFpi = new FhirPackageInstaller({
-    cachePath: customCachePath,
-    skipExamples: true
-  });
 
-  const testFpi = new FhirPackageInstaller();
+  const registryPackages = {
+    [testPkg.id]: {
+      latest: testPkg.version,
+      versions: {
+        [testPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+        },
+      },
+    },
+    [depPkg.id]: {
+      latest: depPkg.version,
+      versions: {
+        [depPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+        },
+      },
+    },
+    [rootPkg.id]: {
+      latest: rootPkg.version,
+      versions: {
+        [rootPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+        },
+      },
+    },
+  };
+
+  const registry = createLocalRegistryServer(registryPackages);
+
+  const silentFpi = new FhirPackageInstaller({ logger: noopLogger });
+
+  let customCacheFpi!: FhirPackageInstaller;
+  let testFpi!: FhirPackageInstaller;
 
   const downloadedPackagesPath = path.join('.', 'test', 'downloaded-packages');
   const resolvedDownloadedPackagesPath = path.resolve(downloadedPackagesPath);
   const fshGeneratedPath = path.join(path.resolve('.'), 'test', 'fsh-generated');
 
   beforeAll(async () => {
+    await registry.start();
+
+    // Create tiny package tarballs for local registry server
+    const testTgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: testPkg.id, version: testPkg.version, dependencies: {} }),
+      'package/ValueSet-test.json': JSON.stringify({ resourceType: 'ValueSet', id: 'test', url: 'http://example.org/ValueSet/test', name: 'TestVS', version: '1.0.0' }),
+      'package/CodeSystem-test.json': JSON.stringify({ resourceType: 'CodeSystem', id: 'test', url: 'http://example.org/CodeSystem/test', name: 'TestCS', version: '1.0.0', content: 'complete' }),
+    });
+    const depTgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: depPkg.id, version: depPkg.version, dependencies: {} }),
+      'package/StructureDefinition-dep.json': JSON.stringify({ resourceType: 'StructureDefinition', id: 'dep', url: 'http://example.org/StructureDefinition/dep', name: 'Dep', version: '1.0.0', kind: 'resource', type: 'Patient' }),
+    });
+    const rootTgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: rootPkg.id, version: rootPkg.version, dependencies: { [depPkg.id]: depPkg.version } }),
+      'package/StructureDefinition-root.json': JSON.stringify({ resourceType: 'StructureDefinition', id: 'root', url: 'http://example.org/StructureDefinition/root', name: 'Root', version: '1.0.0', kind: 'resource', type: 'Patient' }),
+    });
+
+    // Mutate the captured packages object by reference.
+    registryPackages[testPkg.id].versions[testPkg.version].tgz = testTgz;
+    registryPackages[depPkg.id].versions[depPkg.version].tgz = depTgz;
+    registryPackages[rootPkg.id].versions[rootPkg.version].tgz = rootTgz;
+
+    customCacheFpi = new FhirPackageInstaller({
+      cachePath: customCachePath,
+      skipExamples: true,
+      allowHttp: true,
+      registryUrl: registry.getBaseUrl(),
+      logger: noopLogger,
+    });
+
+    testFpi = new FhirPackageInstaller({
+      allowHttp: true,
+      registryUrl: registry.getBaseUrl(),
+      logger: noopLogger,
+    });
+
     // cleanup before running tests
     await fs.remove(customCachePath);
     await fs.remove(resolvedDownloadedPackagesPath);
+  }, 20000);
+
+  afterAll(async () => {
+    await registry.stop();
   }, 20000);
 
   it('should return correct fake package directory path (default cache)', async () => {
@@ -93,30 +160,18 @@ describe('fhir-package-installer module', () => {
     expect(await customCacheFpi.isInstalled(testPkg)).toBe(true);
   }, TIMEOUT);
 
-  it('should install the heavy package successfully',
-    { timeout: TIMEOUT, skip },
-    async () => {
-      const result = await customCacheFpi.install(heavyPackage);
-      expect(result).toBe(true);
-      expect(await customCacheFpi.isInstalled(heavyPackage)).toBe(true);
-    });
-
-  it('should get a valid package index file after install', { skip }, async () => {
+  it('should get a valid package index file after install', async () => {
+    await customCacheFpi.install(testPkg);
     const index = await customCacheFpi.getPackageIndexFile(tstPkgAt);
-    expect(index).toMatchObject({
-      'index-version': 2,
-    });
-    const index2 = await customCacheFpi.getPackageIndexFile(heavyPackage);
-    expect(index2).toMatchObject({
-      'index-version': 2,
-    });
+    expect(index).toMatchObject({ 'index-version': 2 });
+    expect(index.files.length).toBeGreaterThan(0);
   });
 
-  it('should get a valid manifest file after install', { skip }, async () => {
+  it('should get a valid manifest file after install', async () => {
+    await customCacheFpi.install(testPkg);
     const manifest = await customCacheFpi.getManifest(tstPkgHash);
     expect(manifest.name).toBe(testPkg.id);
-    const manifest2 = await customCacheFpi.getManifest(heavyPackage);
-    expect(manifest2.name).toBe(heavyPackage.id);
+    expect(manifest.version).toBe(testPkg.version);
   });
 
   it('should parse a package string to a valid FhirPackageIdentifier object', async () => {
@@ -124,100 +179,71 @@ describe('fhir-package-installer module', () => {
     expect(obj).toEqual({ id: 'pkg.name', version: '1.0.0' });
   });
 
-  it('should get valid dependencies from the test package', { skip }, async () => {
-    const deps = await customCacheFpi.getDependencies(testPkg);
+  it('should get valid dependencies from local fixtures', async () => {
+    await customCacheFpi.install(testPkg);
+    await customCacheFpi.install(rootPkg);
+
+    expect(await customCacheFpi.getDependencies(testPkg)).toEqual({});
+    expect(await customCacheFpi.getDependencies(rootPkg)).toMatchObject({
+      [depPkg.id]: depPkg.version,
+    });
+  });
+
+  it('should install dependency packages transitively (tiny local fixtures)', async () => {
+    const result = await customCacheFpi.install(rootPkg);
+    expect(result).toBe(true);
+    expect(await customCacheFpi.isInstalled(rootPkg)).toBe(true);
+    expect(await customCacheFpi.isInstalled(depPkg)).toBe(true);
+
+    const deps = await customCacheFpi.getDependencies(rootPkg);
     expect(deps).toMatchObject({
-      'hl7.fhir.r4.core': '4.0.1',
-      'hl7.fhir.r4.examples': '4.0.1'
+      [depPkg.id]: depPkg.version,
     });
-    const deps2 = await customCacheFpi.getDependencies(heavyPackage);
-    expect(deps2).toMatchObject({
-      'hl7.fhir.r4.core' : '4.0.1'
-    });
+  }, TIMEOUT);
+
+  it('should generate a stable index for the tiny test package', async () => {
+    const generatedIndex = await customCacheFpi.getPackageIndexFile(tstPkgAt);
+    expect(generatedIndex['index-version']).toBe(2);
+
+    const sorted = sortIndexEntries(generatedIndex.files);
+    expect(sorted).toEqual(
+      sortIndexEntries([
+        {
+          filename: 'CodeSystem-test.json',
+          resourceType: 'CodeSystem',
+          id: 'test',
+          url: 'http://example.org/CodeSystem/test',
+          name: 'TestCS',
+          version: '1.0.0',
+          content: 'complete',
+        },
+        {
+          filename: 'ValueSet-test.json',
+          resourceType: 'ValueSet',
+          id: 'test',
+          url: 'http://example.org/ValueSet/test',
+          name: 'TestVS',
+          version: '1.0.0',
+        },
+      ] as any)
+    );
   });
 
-  it('should get true for isInstalled on all non-example dependencies of test package', async () => {
-    expect({
-      'hl7.fhir.r4.core': await customCacheFpi.isInstalled({ id: 'hl7.fhir.r4.core', version: '4.0.1' }),
-      'hl7.fhir.r4.examples': await customCacheFpi.isInstalled({ id: 'hl7.fhir.r4.examples', version: '4.0.1' })
-    }).toMatchObject({
-      'hl7.fhir.r4.core': true,
-      'hl7.fhir.r4.examples': false
-    });
-  });
 
-  it('should get correct index for hl7.fhir.r4.core package', async () => {
-    const generatedIndex = await customCacheFpi.getPackageIndexFile({ id: 'hl7.fhir.r4.core', version: '4.0.1' });
-    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'hl7.fhir.r4.core-4.0.1.fpi.index.json'));
-
-    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
-
-    // Sort the 'files' array by 'filename' for stable comparison
-    const sortedGenerated = sortIndexEntries(generatedIndex.files);
-    const sortedReference = sortIndexEntries(referenceIndex.files);
-
-    // Deep compare the sorted arrays
-    expect(sortedGenerated).toEqual(sortedReference);
-  });
-
-  it('should get correct index for hl7.fhir.uv.sdc package', async () => {
-    const generatedIndex = await customCacheFpi.getPackageIndexFile({ id: 'hl7.fhir.uv.sdc', version: '3.0.0' });
-    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'hl7.fhir.uv.sdc#3.0.0.json'));
-
-    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
-
-    // Sort the 'files' array by 'filename' for stable comparison
-    const sortedGenerated = sortIndexEntries(generatedIndex.files);
-    const sortedReference = sortIndexEntries(referenceIndex.files);
-
-    // Deep compare the sorted arrays
-    expect(sortedGenerated).toEqual(sortedReference);
-  });
-
-  // us.nlm.vsac#0.11.0.json
-  it('should get correct index for us.nlm.vsac package', { skip }, async () => {
-    const generatedIndex = await customCacheFpi.getPackageIndexFile({ id: 'us.nlm.vsac', version: '0.11.0' });
-    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'us.nlm.vsac#0.11.0.json'));
-
-    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
-
-    // Sort the 'files' array by 'filename' for stable comparison
-    const sortedGenerated = sortIndexEntries(generatedIndex.files);
-    const sortedReference = sortIndexEntries(referenceIndex.files);
-
-    // Deep compare the sorted arrays
-    expect(sortedGenerated).toEqual(sortedReference);
-  });
-
-  it('should correctly re-generate index for hl7.fhir.uv.sdc package', async () => {
-    const pkgDir = await customCacheFpi.getPackageDirPath('hl7.fhir.uv.sdc#3.0.0');
+  it('should correctly re-generate index for tiny test package', async () => {
+    const pkgDir = await customCacheFpi.getPackageDirPath(tstPkgHash);
     const indexToDelete = path.join(pkgDir, 'package', '.fpi.index.json');
     expect(fs.existsSync(indexToDelete)).toBe(true);
     fs.removeSync(indexToDelete);
     expect(fs.existsSync(indexToDelete)).toBe(false);
-    const generatedIndex = await customCacheFpi.getPackageIndexFile('hl7.fhir.uv.sdc@3.0.0');
-    const referenceIndex = fs.readJSONSync(path.join(path.resolve('.'), 'test', 'hl7.fhir.uv.sdc#3.0.0.json'));
-
-    expect(generatedIndex['index-version']).toBe(referenceIndex['index-version']);
-
-    // Sort the 'files' array by 'filename' for stable comparison
-    const sortedGenerated = sortIndexEntries(generatedIndex.files);
-    const sortedReference = sortIndexEntries(referenceIndex.files);
-
-    // Deep compare the sorted arrays
-    expect(sortedGenerated).toEqual(sortedReference);
+    const generatedIndex = await customCacheFpi.getPackageIndexFile(tstPkgAt);
+    expect(generatedIndex['index-version']).toBe(2);
+    expect(generatedIndex.files.length).toBeGreaterThan(0);
   });
 
-  it('should have correct content in the resources', { skip }, () => {
-    const filename = 'ValueSet-1.3.6.1.4.1.6997.4.1.2.234.999.4.2.json';
-    const referenceVs = fs.readJSONSync(path.join(path.resolve('.'), 'test', filename));
-    const installedVs = fs.readJSONSync(path.join(customCachePath, 'us.nlm.vsac#0.11.0', 'package', filename));
-    expect(installedVs).toMatchObject(referenceVs);
-    expect(installedVs).toEqual(referenceVs);
-  });
 
   // Test downloadPackage function
-  describe('downloadPackage', async () => {
+  describe('downloadPackage', () => {
     it('download only - default path', { timeout: TIMEOUT }, async () => {
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: downloadedPackagesPath });
       expect(downloadedPath).toBe(path.join(resolvedDownloadedPackagesPath, `${testPkg.id}-${testPkg.version}.tgz`));
@@ -275,10 +301,8 @@ describe('fhir-package-installer module', () => {
     });
 
     it.each([
-      'hl7.fhir.uv.tools@0.9.0',
-      // 'hl7.fhir.us.davinci-pdex@2.0.0',
-      // 'hl7.fhir.us.davinci-pas@2.0.1',
-      'hl7.fhir.uv.sdc#3.0.0'
+      `${testPkg.id}@${testPkg.version}`,
+      `${rootPkg.id}#${rootPkg.version}`
     ])('should install package: %s', 
       { timeout: TIMEOUT, skip }, 
       async (pkg) => {
@@ -327,8 +351,8 @@ describe('fhir-package-installer module', () => {
     });
 
     it('should successfully install from local folder', async () => {
-      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { installDependencies: true })).resolves.toBe(true);
-      await expect(customCacheFpi.isInstalled(fshGeneratedPkg)).resolves.toBe(true);
+      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { installDependencies: false })).resolves.toBe(true);
+      await expect(customCacheFpi.isInstalled(fshGeneratedPkg, { deep: false })).resolves.toBe(true);
       const pkgPath = await customCacheFpi.getPackageDirPath(fshGeneratedPkg);
       const indexPath = path.join(pkgPath, 'package', '.fpi.index.json');
       const indexExists = await fs.exists(indexPath);
@@ -336,20 +360,20 @@ describe('fhir-package-installer module', () => {
     }, TIMEOUT);
 
     it('should return false when package is already installed', async () => {
-      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { installDependencies: true });
+      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { installDependencies: false });
       await expect(action).resolves.toBe(false);
-      await expect(customCacheFpi.isInstalled(fshGeneratedPkg)).resolves.toBe(true);
+      await expect(customCacheFpi.isInstalled(fshGeneratedPkg, { deep: false })).resolves.toBe(true);
     });
 
     it('should return true when package is already installed and override=true', async () => {
-      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { override: true, installDependencies: true });
+      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { override: true, installDependencies: false });
       await expect(action).resolves.toBe(true);
-      await expect(customCacheFpi.isInstalled(fshGeneratedPkg)).resolves.toBe(true);
+      await expect(customCacheFpi.isInstalled(fshGeneratedPkg, { deep: false })).resolves.toBe(true);
     });
 
     it('should successfully install from local folder with a custom package id', async () => {
-      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { packageId: fakePackage, installDependencies: true })).resolves.toBe(true);
-      await expect(customCacheFpi.isInstalled(fakePackage)).resolves.toBe(true);
+      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { packageId: fakePackage, installDependencies: false })).resolves.toBe(true);
+      await expect(customCacheFpi.isInstalled(fakePackage, { deep: false })).resolves.toBe(true);
     }, TIMEOUT);
 
     it('should successfully install from local tgz file', { timeout: 1000 * 60 * 10 }, async () => {
@@ -358,7 +382,7 @@ describe('fhir-package-installer module', () => {
       const indexPath = path.join(testPkgPath, 'package', '.fpi.index.json');
       await fs.remove(testPkgPath);
       await expect(customCacheFpi.isInstalled(testPkg)).resolves.toBe(false);
-      await expect(customCacheFpi.installLocalPackage(testPkgSrcPath, { installDependencies: true })).resolves.toBe(true);
+      await expect(customCacheFpi.installLocalPackage(testPkgSrcPath, { installDependencies: false })).resolves.toBe(true);
       await expect(customCacheFpi.isInstalled(testPkg)).resolves.toBe(true);
       await expect(fs.exists(indexPath)).resolves.toBe(true);
     });

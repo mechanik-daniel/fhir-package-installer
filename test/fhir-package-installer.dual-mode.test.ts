@@ -4,6 +4,7 @@ import fs from 'fs-extra';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { Logger } from '@outburn/types';
 import { DualModeTestRunner, type TestContext } from './dual-mode-test-runner.js';
+import { createLocalRegistryServer, createTgzBuffer } from './local-registry-server';
 
 const noopLogger: Logger = {
   info: () => {},
@@ -22,12 +23,35 @@ temp.track();
 const TIMEOUT = 240000; // 240 seconds timeout for installation
 
 describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () => {
-  const testPkg = { id: 'hl7.fhir.uv.sdc', version: '3.0.0' };
+  const testPkg = { id: 'dual.pkg', version: '1.0.0' };
   const customCachePath = path.join(path.resolve('.'), 'test', '.dual-mode-cache');
 
+  const registryPackages = {
+    [testPkg.id]: {
+      latest: testPkg.version,
+      versions: {
+        [testPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+        },
+      },
+    },
+  };
+
+  const registry = createLocalRegistryServer(registryPackages);
+
   beforeAll(async () => {
-    // Setup mock Artifactory server
-    await DualModeTestRunner.setupMockServer();
+    await registry.start();
+    const tgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: testPkg.id, version: testPkg.version, dependencies: {} }),
+      'package/ValueSet-dual.json': JSON.stringify({ resourceType: 'ValueSet', id: 'dual', url: 'http://example.org/ValueSet/dual', name: 'DualVS', version: '1.0.0' }),
+    });
+    registryPackages[testPkg.id].versions[testPkg.version].tgz = tgz;
+
+    // Setup mock Artifactory server, proxying to the local registry
+    await DualModeTestRunner.setupMockServer({
+      upstreamRegistryUrl: registry.getBaseUrl(),
+      upstreamTarballBaseUrl: registry.getBaseUrl(),
+    });
     
     // Cleanup and recreate cache directories
     await fs.remove(customCachePath);
@@ -37,6 +61,7 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
   afterAll(async () => {
     // Teardown mock server
     await DualModeTestRunner.teardownMockServer();
+    await registry.stop();
   }, 10000);
 
   describe('Authentication Tests', () => {
@@ -44,20 +69,22 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
       const results = await DualModeTestRunner.runInBothModes(
         async (context: TestContext) => {
           // This should work for both direct (no auth needed) and Artifactory (valid token)
-          const latest = await context.fpi.checkLatestPackageDist('hl7.fhir.uv.sdc');
-          expect(latest).toBe('3.0.0');
+          const latest = await context.fpi.checkLatestPackageDist(testPkg.id);
+          expect(latest).toBe(testPkg.version);
           return { success: true, latest };
         },
         { 
           cachePath: path.join(customCachePath, 'auth-test'),
+          registryUrl: registry.getBaseUrl(),
+          allowHttp: true,
           logger: noopLogger 
         }
       );
 
       expect(results.direct.success).toBe(true);
       expect(results.artifactory.success).toBe(true);
-      expect(results.direct.latest).toBe('3.0.0');
-      expect(results.artifactory.latest).toBe('3.0.0');
+      expect(results.direct.latest).toBe(testPkg.version);
+      expect(results.artifactory.latest).toBe(testPkg.version);
     }, TIMEOUT);
 
     it('should fail with invalid token (Artifactory only)', async () => {
@@ -73,8 +100,8 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
       const { FhirPackageInstaller } = await import('fhir-package-installer');
       const invalidFpi = new FhirPackageInstaller(invalidConfig);
 
-      await expect(invalidFpi.checkLatestPackageDist('hl7.fhir.uv.sdc'))
-        .rejects.toThrow(/Package not found/);
+      await expect(invalidFpi.checkLatestPackageDist(testPkg.id))
+        .rejects.toThrow(/(Forbidden|Unauthorized|authentication failed)/i);
     }, TIMEOUT);
   });
 
@@ -92,6 +119,8 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
         },
         { 
           cachePath: path.join(customCachePath, 'install-test'),
+          registryUrl: registry.getBaseUrl(),
+          allowHttp: true,
           skipExamples: true,
           logger: noopLogger 
         }
@@ -114,15 +143,14 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
           
           expect(manifest.name).toBe(testPkg.id);
           expect(manifest.version).toBe(testPkg.version);
-          expect(dependencies).toMatchObject({
-            'hl7.fhir.r4.core': '4.0.1',
-            'hl7.fhir.r4.examples': '4.0.1'
-          });
+          expect(dependencies).toEqual({});
           
           return { manifest, dependencies };
         },
         { 
           cachePath: path.join(customCachePath, 'metadata-test'),
+          registryUrl: registry.getBaseUrl(),
+          allowHttp: true,
           skipExamples: true,
           logger: noopLogger 
         }
@@ -154,6 +182,8 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
         },
         { 
           cachePath: path.join(customCachePath, 'redirect-test'),
+          registryUrl: registry.getBaseUrl(),
+          allowHttp: true,
           logger: debugLogger // Use debug logger to see redirect messages
         }
       );
@@ -181,6 +211,8 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
         },
         { 
           cachePath: path.join(customCachePath, 'error-test'),
+          registryUrl: registry.getBaseUrl(),
+          allowHttp: true,
           logger: noopLogger 
         }
       );
@@ -216,6 +248,8 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
         },
         { 
           cachePath: path.join(customCachePath, 'index-test'),
+          registryUrl: registry.getBaseUrl(),
+          allowHttp: true,
           skipExamples: true,
           logger: noopLogger 
         }

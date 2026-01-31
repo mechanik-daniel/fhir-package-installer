@@ -8,9 +8,9 @@ import { URL } from 'url';
  *
  * Features:
  * 1. Bearer token auth (single fixed token) -> 401 if missing, 403 if invalid.
- * 2. Package metadata proxying to the real Simplifier / packages.fhir.org endpoint.
+ * 2. Package metadata proxying to an upstream registry (defaults to packages.fhir.org).
  * 3. Tarball URL rewriting so downstream code exercises redirect logic.
- * 4. Tarball request simulation via 302 redirect to the real Simplifier tarball.
+ * 4. Tarball request simulation via 302 redirect to an upstream tarball base (defaults to packages.simplifier.net).
  *
  * NOT FOR PRODUCTION USE. Surface is intentionally small; breaking changes unlikely but
  * additions may occur in minor versions. Kept here so downstream libraries can reuse
@@ -32,13 +32,24 @@ interface PackageVersionMeta {
   [k: string]: unknown;
 }
 
+export type MockArtifactoryServerOptions = {
+  /** Upstream npm-like registry base URL, e.g. https://packages.fhir.org or http://localhost:PORT */
+  upstreamRegistryUrl?: string;
+  /** Upstream tarball base URL used for 302 redirects, e.g. https://packages.simplifier.net or http://localhost:PORT */
+  upstreamTarballBaseUrl?: string;
+};
+
 class InternalMockArtifactoryServer implements MockArtifactoryServerApi {
   private server: http.Server;
   private port: number;
   private readonly validToken = 'test-token';
+  private upstreamRegistryUrl: string;
+  private upstreamTarballBaseUrl: string;
 
-  constructor(port: number) {
+  constructor(port: number, options: MockArtifactoryServerOptions = {}) {
     this.port = port;
+    this.upstreamRegistryUrl = options.upstreamRegistryUrl ?? 'https://packages.fhir.org';
+    this.upstreamTarballBaseUrl = options.upstreamTarballBaseUrl ?? 'https://packages.simplifier.net';
     this.server = this.createServer();
   }
 
@@ -132,14 +143,16 @@ class InternalMockArtifactoryServer implements MockArtifactoryServerApi {
     const tgzFile = parts.at(-1);
     const packageName = parts.at(-3); // <package>/-/<file>
     if (!tgzFile || !packageName) { this.json(res, 404, { error: 'Tarball not found' }); return; }
-    const redirectUrl = `https://packages.simplifier.net/${packageName}/-/${tgzFile}`;
+    const base = this.upstreamTarballBaseUrl.replace(/\/+$/, '');
+    const redirectUrl = `${base}/${packageName}/-/${tgzFile}`;
     res.writeHead(302, { Location: redirectUrl, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: 'Redirecting to Simplifier' }));
   }
 
   private async fetchAndRewrite(packageName: string, res: http.ServerResponse) {
     try {
-      const sourceUrl = `https://packages.fhir.org/${packageName}/`;
+      const base = this.upstreamRegistryUrl.replace(/\/+$/, '');
+      const sourceUrl = `${base}/${packageName}/`;
       const { data } = await this.fetchRaw(sourceUrl);
       const modified = this.rewriteTarballs(data);
       this.json(res, 200, modified);
@@ -150,7 +163,9 @@ class InternalMockArtifactoryServer implements MockArtifactoryServerApi {
 
   private fetchRaw(url: string): Promise<{ statusCode: number; data: string }> {
     return new Promise((resolve, reject) => {
-      https.get(url, (resp) => {
+      const parsed = new URL(url);
+      const client = parsed.protocol === 'http:' ? http : https;
+      client.get(url, (resp) => {
         let acc = '';
         resp.on('data', (chunk) => acc += chunk);
         resp.on('end', () => resolve({ statusCode: resp.statusCode || 0, data: acc }));
@@ -189,8 +204,11 @@ class InternalMockArtifactoryServer implements MockArtifactoryServerApi {
 /** Factory to create a new mock Artifactory server instance.
  * @param port Optional port. Pass 0 for ephemeral.
  */
-export function createMockArtifactoryServer(port: number = 3333): MockArtifactoryServerApi {
-  return new InternalMockArtifactoryServer(port);
+export function createMockArtifactoryServer(
+  port: number = 3333,
+  options: MockArtifactoryServerOptions = {}
+): MockArtifactoryServerApi {
+  return new InternalMockArtifactoryServer(port, options);
 }
 
 export const MOCK_ARTIFACTORY_VALID_TOKEN = 'test-token';
