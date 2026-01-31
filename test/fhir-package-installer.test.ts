@@ -327,7 +327,7 @@ describe('fhir-package-installer module', () => {
     });
 
     it('should successfully install from local folder', async () => {
-      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath)).resolves.toBe(true);
+      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { installDependencies: true })).resolves.toBe(true);
       await expect(customCacheFpi.isInstalled(fshGeneratedPkg)).resolves.toBe(true);
       const pkgPath = await customCacheFpi.getPackageDirPath(fshGeneratedPkg);
       const indexPath = path.join(pkgPath, 'package', '.fpi.index.json');
@@ -336,19 +336,19 @@ describe('fhir-package-installer module', () => {
     }, TIMEOUT);
 
     it('should return false when package is already installed', async () => {
-      const action = customCacheFpi.installLocalPackage(fshGeneratedPath);
+      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { installDependencies: true });
       await expect(action).resolves.toBe(false);
       await expect(customCacheFpi.isInstalled(fshGeneratedPkg)).resolves.toBe(true);
     });
 
     it('should return true when package is already installed and override=true', async () => {
-      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { override: true });
+      const action = customCacheFpi.installLocalPackage(fshGeneratedPath, { override: true, installDependencies: true });
       await expect(action).resolves.toBe(true);
       await expect(customCacheFpi.isInstalled(fshGeneratedPkg)).resolves.toBe(true);
     });
 
     it('should successfully install from local folder with a custom package id', async () => {
-      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { packageId: fakePackage })).resolves.toBe(true);
+      await expect(customCacheFpi.installLocalPackage(fshGeneratedPath, { packageId: fakePackage, installDependencies: true })).resolves.toBe(true);
       await expect(customCacheFpi.isInstalled(fakePackage)).resolves.toBe(true);
     }, TIMEOUT);
 
@@ -358,7 +358,7 @@ describe('fhir-package-installer module', () => {
       const indexPath = path.join(testPkgPath, 'package', '.fpi.index.json');
       await fs.remove(testPkgPath);
       await expect(customCacheFpi.isInstalled(testPkg)).resolves.toBe(false);
-      await expect(customCacheFpi.installLocalPackage(testPkgSrcPath)).resolves.toBe(true);
+      await expect(customCacheFpi.installLocalPackage(testPkgSrcPath, { installDependencies: true })).resolves.toBe(true);
       await expect(customCacheFpi.isInstalled(testPkg)).resolves.toBe(true);
       await expect(fs.exists(indexPath)).resolves.toBe(true);
     });
