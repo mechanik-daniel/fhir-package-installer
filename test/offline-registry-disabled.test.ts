@@ -21,6 +21,13 @@ const writeInstalledPackage = async (cachePath: string, id: string, version: str
   });
 };
 
+const writeCorruptInstalledPackage = async (cachePath: string, id: string, version: string) => {
+  const pkgDir = path.join(cachePath, `${id}#${version}`, 'package');
+  await fs.ensureDir(pkgDir);
+  // Intentionally invalid JSON to simulate corruption.
+  await fs.writeFile(path.join(pkgDir, 'package.json'), '{ this is not valid json', { encoding: 'utf8' });
+};
+
 describe('Registry disabled/offline behaviors', () => {
   const cachePath = path.join(path.resolve('.'), 'test', '.test-cache-registry-disabled');
 
@@ -73,14 +80,42 @@ describe('Registry disabled/offline behaviors', () => {
     await writeInstalledPackage(cachePath, 'a.pkg', '1.0.0', { 'b.pkg': '1.0.0' });
 
     const fpi = new FhirPackageInstaller({ cachePath, logger: noopLogger });
+    // Shallow: the package itself exists.
+    expect(await fpi.isInstalled({ id: 'a.pkg', version: '1.0.0' }, { deep: false })).toBe(true);
+    // Deep: dependency is missing.
     expect(await fpi.isInstalled({ id: 'a.pkg', version: '1.0.0' })).toBe(false);
 
     // Create b.pkg directory but without package.json
     await fs.ensureDir(path.join(cachePath, 'b.pkg#1.0.0', 'package'));
+    expect(await fpi.isInstalled({ id: 'a.pkg', version: '1.0.0' }, { deep: false })).toBe(true);
     expect(await fpi.isInstalled({ id: 'a.pkg', version: '1.0.0' })).toBe(false);
 
     // Add b.pkg manifest, now it should be fully installed.
     await writeInstalledPackage(cachePath, 'b.pkg', '1.0.0');
     expect(await fpi.isInstalled({ id: 'a.pkg', version: '1.0.0' })).toBe(true);
+  });
+
+  it('isInstalled (deep) throws for corrupted package manifests', async () => {
+    await writeCorruptInstalledPackage(cachePath, 'bad.pkg', '1.0.0');
+    const fpi = new FhirPackageInstaller({ cachePath, logger: noopLogger });
+    // Shallow check passes (file exists) but deep validation should surface parse failure.
+    await expect(fpi.isInstalled({ id: 'bad.pkg', version: '1.0.0' }, { deep: false })).resolves.toBe(true);
+    await expect(fpi.isInstalled({ id: 'bad.pkg', version: '1.0.0' }, { deep: true }))
+      .rejects.toThrow();
+  });
+
+  it('isInstalled (deep) throws for unexpected infra errors (e.g., permissions)', async () => {
+    await writeInstalledPackage(cachePath, 'a.pkg', '1.0.0');
+    const fpi = new FhirPackageInstaller({ cachePath, logger: noopLogger });
+
+    // Simulate an infrastructure failure during deep validation.
+    (fpi as any).collectMissingPackages = async () => {
+      const err: any = new Error('Permission denied');
+      err.code = 'EACCES';
+      throw err;
+    };
+
+    await expect(fpi.isInstalled({ id: 'a.pkg', version: '1.0.0' }, { deep: true }))
+      .rejects.toMatchObject({ code: 'EACCES' });
   });
 });
