@@ -626,8 +626,17 @@ export class FhirPackageInstaller {
             'Authorization': `Bearer ${this.registryToken}`
           };
         }
-      } catch {
-        // If registryUrl isn't a valid URL (e.g., registryUrl='n/a'), skip auth headers.
+      } catch (err: any) {
+        // If registryUrl isn't a valid URL, skip auth headers.
+        // However, log a warning so misconfiguration is visible.
+        const normalizedRegistryUrl = (this.registryUrl || '').trim().toLowerCase();
+        if (normalizedRegistryUrl !== 'n/a') {
+          const displayUrl = url.length > 128 ? `${url.substring(0, 128)}...` : url;
+          this.logger.warn(
+            `Failed to parse URL(s) for auth header (registryUrl='${this.registryUrl}', url='${displayUrl}'); proceeding without auth header. ` +
+            `Error: ${err?.message || String(err)}`
+          );
+        }
       }
     }
     
