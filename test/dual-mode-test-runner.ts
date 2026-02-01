@@ -8,6 +8,7 @@ interface FpiConfig {
   registryToken?: string;
   cachePath?: string;
   skipExamples?: boolean;
+  allowHttp?: boolean;
 }
 
 export interface TestContext {
@@ -26,9 +27,9 @@ export class DualModeTestRunner {
   /**
    * Sets up mock Artifactory server for testing
    */
-  static async setupMockServer(): Promise<MockArtifactoryServer> {
+  static async setupMockServer(options: { upstreamRegistryUrl?: string; upstreamTarballBaseUrl?: string } = {}): Promise<MockArtifactoryServer> {
     if (!this.mockServer) {
-      this.mockServer = new MockArtifactoryServer(this.MOCK_PORT);
+      this.mockServer = new MockArtifactoryServer(this.MOCK_PORT, options);
       await this.mockServer.start();
     }
     return this.mockServer;

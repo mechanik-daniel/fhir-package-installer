@@ -17,5 +17,10 @@ export interface FpiConfig {
     allowHttp?: boolean // allow HTTP URLs for testing (default: false)
     requestTimeoutMs?: number // HTTP request timeout (default: 90000)
     extractTimeoutMs?: number // tarball extraction timeout (default: 60000)
+    /**
+     * TTL (ms) for cached registry lookups (unversioned package documents, dist-tags, etc).
+     * Default: 30 minutes.
+     */
+    registryTtlMs?: number
   }
   

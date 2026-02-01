@@ -19,9 +19,19 @@ export class MockArtifactoryServer {
   private server: http.Server;
   private port: number;
   private readonly validToken = 'test-token';
+  private upstreamRegistryUrl: string;
+  private upstreamTarballBaseUrl: string;
 
-  constructor(port: number = 3333) {
+  constructor(
+    port: number = 3333,
+    options: {
+      upstreamRegistryUrl?: string;
+      upstreamTarballBaseUrl?: string;
+    } = {}
+  ) {
     this.port = port;
+    this.upstreamRegistryUrl = options.upstreamRegistryUrl ?? 'https://packages.fhir.org';
+    this.upstreamTarballBaseUrl = options.upstreamTarballBaseUrl ?? 'https://packages.simplifier.net';
     this.server = this.createServer();
   }
 
@@ -118,10 +128,9 @@ export class MockArtifactoryServer {
       return;
     }
 
-    // Use the existing metadata handler logic but with extracted package name
     try {
-      const simplifierUrl = `https://packages.fhir.org/${packageName}/`;
-      const packageData = await this.fetchFromSimplifier(simplifierUrl);
+      const upstreamUrl = `${this.upstreamRegistryUrl.replace(/\/+$/, '')}/${packageName}/`;
+      const packageData = await this.fetchFromUpstream(upstreamUrl);
       
       // Modify tarball URLs to point to our mock server
       const modifiedResponse = this.modifyTarballUrls(packageData.data);
@@ -145,8 +154,8 @@ export class MockArtifactoryServer {
     }
 
     try {
-      const simplifierUrl = `https://packages.fhir.org/${packageName}/`;
-      const packageData = await this.fetchFromSimplifier(simplifierUrl);
+      const upstreamUrl = `${this.upstreamRegistryUrl.replace(/\/+$/, '')}/${packageName}/`;
+      const packageData = await this.fetchFromUpstream(upstreamUrl);
       
       // Modify tarball URLs to point to our mock server
       const modifiedResponse = this.modifyTarballUrls(packageData.data);
@@ -165,19 +174,24 @@ export class MockArtifactoryServer {
     const tgzFile = pathParts[pathParts.length - 1];
     const packageName = pathParts[pathParts.length - 3];
     
-    // Simulate redirect to Simplifier
-    const simplifierTarballUrl = `https://packages.simplifier.net/${packageName}/-/${tgzFile}`;
+    // Simulate redirect (Artifactory often responds with 302 for blob storage).
+    // Default behavior points to Simplifier; tests can override to point to a local upstream.
+    const tarballBase = this.upstreamTarballBaseUrl.replace(/\/+$/, '');
+    const upstreamTarballUrl = `${tarballBase}/${packageName}/-/${tgzFile}`;
     
     res.writeHead(302, { 
-      'Location': simplifierTarballUrl,
+      'Location': upstreamTarballUrl,
       'Content-Type': 'application/json'
     });
     res.end(JSON.stringify({ message: 'Redirecting to Simplifier' }));
   }
 
-  private async fetchFromSimplifier(url: string): Promise<{ statusCode: number; data: string }> {
+  private async fetchFromUpstream(url: string): Promise<{ statusCode: number; data: string }> {
     return new Promise((resolve, reject) => {
-      https.get(url, (response) => {
+      const parsed = new URL(url);
+      const client = parsed.protocol === 'http:' ? http : https;
+      client
+        .get(url, (response) => {
         let data = '';
         response.on('data', (chunk) => data += chunk);
         response.on('end', () => {
@@ -190,7 +204,8 @@ export class MockArtifactoryServer {
             reject(error);
           }
         });
-      }).on('error', reject);
+      })
+        .on('error', reject);
     });
   }
 

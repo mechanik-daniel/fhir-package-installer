@@ -16,6 +16,7 @@ import * as zlib from 'zlib';
 import temp from 'temp';
 import os from 'os';
 import semver from 'semver';
+import crypto from 'crypto';
  
 
 import type {
@@ -33,6 +34,18 @@ import type {
 import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
 temp.track();
+
+// NOTE: This is injected at build time via tsup `define` (see tsup.config.ts).
+// It must NOT be read from package.json at runtime (supports SEA/bundling scenarios).
+declare const __FPI_VERSION__: string | undefined;
+const FPI_VERSION = typeof __FPI_VERSION__ === 'string' && __FPI_VERSION__.trim().length > 0
+  ? __FPI_VERSION__
+  : '0.0.0';
+const FPI_INDEX_CACHE_VERSION = (() => {
+  const v = semver.parse(FPI_VERSION);
+  if (!v) return '0.0';
+  return `${v.major}.${v.minor}`;
+})();
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
@@ -53,7 +66,89 @@ const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
   ]
 };
 
-const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+// TTL for cached registry lookups (stored under `cachePath`)
+const DEFAULT_REGISTRY_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// Process-wide in-memory cache sizing
+const MEM_CACHE_MAX_ENTRIES = 500;
+
+// ---- Module-level (process-wide) single-flight maps ----
+// These are intentionally module-scoped so multiple FhirPackageInstaller instances within
+// the same Node process coordinate and don't duplicate work.
+const inFlightJson = new Map<string, Promise<any>>();
+const inFlightTarball = new Map<string, Promise<string>>();
+const inFlightIndex = new Map<string, Promise<PackageIndex>>();
+
+const withSingleFlight = async <T>(
+  map: Map<string, Promise<T>>,
+  key: string,
+  fn: () => Promise<T>
+): Promise<T> => {
+  const existing = map.get(key);
+  if (existing) return existing;
+
+  const p = (async () => {
+    try {
+      return await fn();
+    } finally {
+      map.delete(key);
+    }
+  })();
+
+  map.set(key, p);
+  return p;
+};
+
+const sha256Hex = (value: string): string => crypto.createHash('sha256').update(value).digest('hex');
+
+type DiskCacheEnvelope<T> = {
+  expiresAt: number;
+  data: T;
+};
+
+type MemCacheEnvelope<T> = {
+  expiresAt?: number;
+  value: T;
+};
+
+// ---- Module-level (process-wide) TTL memory cache ----
+// Shared across all FhirPackageInstaller instances in the same Node process.
+const memCache = new Map<string, MemCacheEnvelope<any>>();
+
+const memGet = <T>(key: string): T | null => {
+  const e = memCache.get(key);
+  if (!e) return null;
+  if (typeof e.expiresAt === 'number') {
+    if (Date.now() >= e.expiresAt) {
+      memCache.delete(key);
+      return null;
+    }
+  }
+  return e.value as T;
+};
+
+const memSet = <T>(key: string, value: T, ttlMs: number): void => {
+  const expiresAt = Date.now() + ttlMs;
+  // Update insertion order for LRU-ish behavior.
+  memCache.delete(key);
+  memCache.set(key, { expiresAt, value });
+  while (memCache.size > MEM_CACHE_MAX_ENTRIES) {
+    const firstKey = memCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    memCache.delete(firstKey);
+  }
+};
+
+const memSetNoTtl = <T>(key: string, value: T): void => {
+  // Update insertion order for LRU-ish behavior.
+  memCache.delete(key);
+  memCache.set(key, { value });
+  while (memCache.size > MEM_CACHE_MAX_ENTRIES) {
+    const firstKey = memCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    memCache.delete(firstKey);
+  }
+};
 
 /**
  * Default logger is a no-op.
@@ -70,7 +165,8 @@ const defaultLogger: Logger = {
 /**
  * Max number of concurrent file operations (read / write))
  */
-const limit = pLimit(Math.max(4, os.cpus().length));
+// Cap concurrency to reduce risk of EMFILE/too-many-open-files on Windows.
+const limit = pLimit(Math.max(4, Math.min(32, os.cpus().length)));
 
 /**
  * Generates an index entry for the package resource
@@ -101,10 +197,11 @@ const extractResourceIndexEntry = (filename: string, content: PackageResource): 
 export class FhirPackageInstaller {
   private logger: Logger = defaultLogger;
   private registryUrl = 'https://packages.fhir.org';
+  private registryDisabled = false;
   private registryToken?: string; // optional token for private registries
-  private fallbackUrlBase = 'https://packages.simplifier.net';
   private requestTimeoutMs = 90000; // 90 seconds
   private extractTimeoutMs = 60000; // 60 seconds
+  private registryTtlMs = DEFAULT_REGISTRY_TTL_MS;
   /**
    * Path to the FHIR package cache directory.
    * This directory is used to store downloaded and extracted FHIR packages.
@@ -125,10 +222,16 @@ export class FhirPackageInstaller {
       skipExamples,
       allowHttp,
       requestTimeoutMs,
-      extractTimeoutMs
+      extractTimeoutMs,
+      registryTtlMs
     } = config || {} as FpiConfig;
     if (registryUrl) {
+      const normalized = registryUrl.trim();
       this.registryUrl = registryUrl;
+      if (normalized.toLowerCase() === 'n/a') {
+        this.registryUrl = 'n/a';
+        this.registryDisabled = true;
+      }
     }
     if (registryToken) {
       this.registryToken = registryToken;
@@ -146,12 +249,226 @@ export class FhirPackageInstaller {
     if (typeof extractTimeoutMs === 'number' && Number.isFinite(extractTimeoutMs) && extractTimeoutMs > 0) {
       this.extractTimeoutMs = extractTimeoutMs;
     }
+    // Unify registry TTL config.
+    const effectiveRegistryTtlMs =
+      (typeof registryTtlMs === 'number' && Number.isFinite(registryTtlMs) && registryTtlMs > 0)
+        ? registryTtlMs
+        : undefined;
+    if (typeof effectiveRegistryTtlMs === 'number') {
+      this.registryTtlMs = effectiveRegistryTtlMs;
+    }
     if (logger) {
       this.logger = logger;
     }
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
+  }
+
+  private async withDiskLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // Lock files live under cachePath so we never write outside user-controlled boundaries.
+    const locksDir = await this.ensureDiskCacheSubdir('locks');
+    const lockPath = path.join(locksDir, `${sha256Hex(lockKey)}.lock`);
+
+    const start = Date.now();
+    const maxWaitMs = Math.max(1000, this.requestTimeoutMs);
+    const staleMs = Math.max(2 * 60 * 1000, maxWaitMs * 2);
+
+    while (true) {
+      try {
+        await fs.ensureDir(path.dirname(lockPath));
+        await fs.writeFile(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: 'wx' });
+        const heartbeat = setInterval(() => {
+          // Keep mtime fresh so waiters can distinguish live vs stale locks.
+          fs.utimes(lockPath, new Date(), new Date()).catch(() => undefined);
+        }, 1000);
+        (heartbeat as any).unref?.();
+        try {
+          return await fn();
+        } finally {
+          clearInterval(heartbeat);
+          await fs.remove(lockPath).catch(() => undefined);
+        }
+      } catch (e: any) {
+        if (e?.code !== 'EEXIST') {
+          // If locking fails for other reasons, don't break functionality.
+          return await fn();
+        }
+
+        // If the lock looks stale, attempt to break it.
+        try {
+          const stat = await fs.stat(lockPath);
+          if (Date.now() - stat.mtimeMs > staleMs) {
+            await fs.remove(lockPath).catch(() => undefined);
+            continue;
+          }
+        } catch {
+          // ignore
+        }
+
+        if (Date.now() - start > maxWaitMs) {
+          // Avoid deadlocks: proceed without the lock after waiting.
+          return await fn();
+        }
+
+        await new Promise((r) => setTimeout(r, 50 + Math.floor(Math.random() * 100)));
+      }
+    }
+  }
+
+  // ---- Per-cachePath persistent cache helpers ----
+  private async ensureDiskCacheSubdir(name: string): Promise<string> {
+    const dir = path.join(this.cachePath, '.fpi.cache', name);
+    await fs.ensureDir(dir);
+    return dir;
+  }
+
+  private getDiskCacheKeyPrefix(): string {
+    // Avoid accidental cross-registry pollution for metadata/tarballs.
+    return `${this.registryUrl}`;
+  }
+
+  private async readDiskCacheJson<T>(filePath: string): Promise<T | null> {
+    try {
+      if (!await fs.exists(filePath)) return null;
+      const raw = await fs.readJSON(filePath, { encoding: 'utf8' }) as any;
+      if (!raw || typeof raw !== 'object') return null;
+
+      // TTL envelope format: { expiresAt: number, data: T }
+      if (typeof raw.expiresAt === 'number' && 'data' in raw) {
+        if (Date.now() >= raw.expiresAt) {
+          // Lazy eviction
+          await fs.remove(filePath).catch(() => undefined);
+          return null;
+        }
+        return raw.data as T;
+      }
+
+      // Non-TTL format: just the raw data.
+      return raw as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeDiskCacheJson<T>(filePath: string, data: T, ttlMs: number): Promise<void> {
+    try {
+      await fs.ensureDir(path.dirname(filePath));
+      const expiresAt = Date.now() + ttlMs;
+      const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeJSON(tmp, { expiresAt, data } satisfies DiskCacheEnvelope<T>);
+      await fs.move(tmp, filePath, { overwrite: true });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private async writeDiskCacheJsonNoTtl<T>(filePath: string, data: T): Promise<void> {
+    try {
+      await fs.ensureDir(path.dirname(filePath));
+      const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeJSON(tmp, data);
+      await fs.move(tmp, filePath, { overwrite: true });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private getDiskRegistryMetadataCachePath(packageName: string): string {
+    const key = `registry-meta|${this.getDiskCacheKeyPrefix()}|${packageName}`;
+    return path.join(this.cachePath, '.fpi.cache', 'metadata', `${sha256Hex(key)}.json`);
+  }
+
+  private getDiskIndexCachePath(packageObject: FhirPackageIdentifier): string {
+    const key = `index|${FPI_INDEX_CACHE_VERSION}|${packageObject.id}#${packageObject.version}`;
+    return path.join(this.cachePath, '.fpi.cache', 'indexes', `${sha256Hex(key)}.json`);
+  }
+
+  private getDiskTarballCacheKey(packageObject: FhirPackageIdentifier): string {
+    return `tarball|${this.getDiskCacheKeyPrefix()}|${packageObject.id}#${packageObject.version}`;
+  }
+
+  private async getDiskTarballCachePaths(packageObject: FhirPackageIdentifier): Promise<{ tgzPath: string; donePath: string }> {
+    const tarDir = await this.ensureDiskCacheSubdir('tarballs');
+    const tgzPath = path.join(tarDir, `${sha256Hex(this.getDiskTarballCacheKey(packageObject))}.tgz`);
+    const donePath = `${tgzPath}.done`;
+    return { tgzPath, donePath };
+  }
+
+  private async readDiskTarballCache(packageObject: FhirPackageIdentifier): Promise<string | null> {
+    try {
+      const { tgzPath, donePath } = await this.getDiskTarballCachePaths(packageObject);
+      if (!await fs.exists(tgzPath)) return null;
+
+      // We treat tarballs as immutable when keyed by id+version.
+      // Use a done marker to avoid using a partially-written tgz after a crash.
+      if (!await fs.exists(donePath)) {
+        await fs.remove(tgzPath).catch(() => undefined);
+        return null;
+      }
+      return tgzPath;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeDiskTarballDoneMarker(donePath: string): Promise<void> {
+    try {
+      const tmp = `${donePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeFile(tmp, 'ok');
+      await fs.move(tmp, donePath, { overwrite: true });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private getIndexMemKey(packageObject: FhirPackageIdentifier): string {
+    // Indexes are keyed only by immutable identity (package id+version) plus FPI minor version.
+    // Do not include cachePath here: different installer instances in the same process should share.
+    return `index|${FPI_INDEX_CACHE_VERSION}|${packageObject.id}#${packageObject.version}`;
+  }
+
+  private getIndexDiskLockKey(packageObject: FhirPackageIdentifier): string {
+    return `index-cache|${FPI_INDEX_CACHE_VERSION}|${packageObject.id}#${packageObject.version}`;
+  }
+
+  private isRegistryDisabled(): boolean {
+    return this.registryDisabled;
+  }
+
+  private formatRegistryDisabledMessage(detail: string): string {
+    return `FHIR package registry is disabled (registryUrl=n/a). ${detail}`;
+  }
+
+  private async packageManifestExists(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    const packageDir = await this.getPackageDirPath(packageObject);
+    return await fs.exists(path.join(packageDir, 'package', 'package.json'));
+  }
+
+  private async collectMissingPackages(root: FhirPackageIdentifier): Promise<string[]> {
+    const missing: string[] = [];
+    const visited = new Set<string>();
+
+    const visit = async (pkg: FhirPackageIdentifier) => {
+      const key = `${pkg.id}#${pkg.version}`;
+      if (visited.has(key)) return;
+      visited.add(key);
+
+      const hasManifest = await this.packageManifestExists(pkg);
+      if (!hasManifest) {
+        missing.push(key);
+        return;
+      }
+
+      const deps = await this.getDependencies(pkg);
+      for (const [depId, depVersion] of Object.entries(deps || {})) {
+        if (this.skipExamples && depId.includes('examples')) continue;
+        await visit({ id: depId, version: depVersion });
+      }
+    };
+
+    await visit(root);
+    return missing;
   }
 
   private async withRetries<T>(
@@ -225,27 +542,69 @@ export class FhirPackageInstaller {
     this.logger.info(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
     const packagePath = await this.getPackageDirPath(pckIdObj);
     const indexPath = await this.getPackageIndexPath(pckIdObj);
-    const fileList = await fs.readdir(path.join(packagePath, 'package'));
-    const files = await Promise.all(
-      fileList.filter(
-        file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
-      ).map(
-        file => limit(
-          async () => {
-            const contentText = await fs.readFile(path.join(packagePath, 'package', file), { encoding: 'utf8' });
-            const content = JSON.parse(contentText) as PackageResource;
-            const indexEntry = extractResourceIndexEntry(file, content);
-            return indexEntry;
-          }
+
+    // Layer 1: memory
+    const memKey = this.getIndexMemKey(pckIdObj);
+    const memHit = memGet<PackageIndex>(memKey);
+    if (memHit) {
+      await fs.writeJSON(indexPath, memHit);
+      return memHit;
+    }
+
+    // Cross-process: ensure only one process does the expensive scan per package version.
+    return await this.withDiskLock(this.getIndexDiskLockKey(pckIdObj), async () => {
+      // Re-check memory after acquiring the lock.
+      const memHit2 = memGet<PackageIndex>(memKey);
+      if (memHit2) {
+        await fs.writeJSON(indexPath, memHit2);
+        return memHit2;
+      }
+
+      // Layer 2: per-cachePath disk
+      const diskPath = this.getDiskIndexCachePath(pckIdObj);
+      const diskHit = await withSingleFlight(inFlightIndex, `disk-${memKey}`, async () => {
+        // Ensure parent exists lazily
+        await this.ensureDiskCacheSubdir('indexes');
+        return await this.readDiskCacheJson<PackageIndex>(diskPath);
+      });
+      if (diskHit) {
+        memSetNoTtl(memKey, diskHit);
+        await fs.writeJSON(indexPath, diskHit);
+        return diskHit;
+      }
+
+      const fileList = await fs.readdir(path.join(packagePath, 'package'));
+      const files = await Promise.all(
+        fileList.filter(
+          file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
+        ).map(
+          file => limit(
+            async () => {
+              const contentText = await fs.readFile(path.join(packagePath, 'package', file), { encoding: 'utf8' });
+              const content = JSON.parse(contentText) as PackageResource;
+              const indexEntry = extractResourceIndexEntry(file, content);
+              return indexEntry;
+            }
+          )
         )
-      )
-    );
-    const indexJson: PackageIndex = {
-      'index-version': 2,
-      files
-    };
-    await fs.writeJSON(indexPath, indexJson);
-    return indexJson;
+      );
+      const indexJson: PackageIndex = {
+        'index-version': 2,
+        files
+      };
+      await fs.writeJSON(indexPath, indexJson);
+
+      // Persist to memory + per-cachePath disk (best-effort)
+      memSetNoTtl(memKey, indexJson);
+      try {
+        await this.ensureDiskCacheSubdir('indexes');
+        await this.writeDiskCacheJsonNoTtl(diskPath, indexJson);
+      } catch {
+        // ignore
+      }
+
+      return indexJson;
+    });
   }
 
   /**
@@ -258,14 +617,26 @@ export class FhirPackageInstaller {
     
     // Add authorization header for requests to the configured registry
     // or any URL that contains the same hostname (to handle redirects within the same registry)
-    if (this.registryToken) {
-      const registryHostname = new URL(this.registryUrl).hostname;
-      const urlHostname = new URL(url).hostname;
-      
-      if (url.startsWith(this.registryUrl) || urlHostname === registryHostname) {
-        options.headers = {
-          'Authorization': `Bearer ${this.registryToken}`
-        };
+    if (this.registryToken && !this.isRegistryDisabled()) {
+      try {
+        const registryHostname = new URL(this.registryUrl).hostname;
+        const urlHostname = new URL(url).hostname;
+        if (url.startsWith(this.registryUrl) || urlHostname === registryHostname) {
+          options.headers = {
+            'Authorization': `Bearer ${this.registryToken}`
+          };
+        }
+      } catch (err: any) {
+        // If registryUrl isn't a valid URL, skip auth headers.
+        // However, log a warning so misconfiguration is visible.
+        const normalizedRegistryUrl = (this.registryUrl || '').trim().toLowerCase();
+        if (normalizedRegistryUrl !== 'n/a') {
+          const displayUrl = url.length > 128 ? `${url.substring(0, 128)}...` : url;
+          this.logger.warn(
+            `Failed to parse URL(s) for auth header (registryUrl='${this.registryUrl}', url='${displayUrl}'); proceeding without auth header. ` +
+            `Error: ${err?.message || String(err)}`
+          );
+        }
       }
     }
     
@@ -400,7 +771,12 @@ export class FhirPackageInstaller {
           });
           resolve(res);
         } else {
-          reject(new Error(`Failed to fetch ${url} (status ${res.statusCode})`));
+          const code = res.statusCode ?? 0;
+          if (code === 404) {
+            reject(new Error(`Failed to fetch ${url} (status 404): not found`));
+          } else {
+            reject(new Error(`Failed to fetch ${url} (status ${code})`));
+          }
         }
       });
 
@@ -415,36 +791,70 @@ export class FhirPackageInstaller {
   }  
 
   private async getPackageDataFromRegistry(packageName: string): Promise<Record<string, any>> {
-    return await this.fetchJson(`${this.registryUrl}/${packageName}/`);
+    if (this.isRegistryDisabled()) {
+      throw new Error(this.formatRegistryDisabledMessage(`Cannot query registry for package metadata (${packageName}).`));
+    }
+
+    const url = `${this.registryUrl}/${packageName}/`;
+    const cacheKey = `fetch-json|${url}`;
+
+    // Layer 1: memory
+    const memKey = `registry-meta|${this.registryUrl}|${packageName}`;
+    const memHit = memGet<Record<string, any>>(memKey);
+    if (memHit) return memHit;
+
+    // Layer 2: per-cachePath disk
+    const diskPath = this.getDiskRegistryMetadataCachePath(packageName);
+
+    return await withSingleFlight(inFlightJson, cacheKey, async () => {
+      const memHit2 = memGet<Record<string, any>>(memKey);
+      if (memHit2) return memHit2;
+
+      return await this.withDiskLock(`registry-meta|${this.getDiskCacheKeyPrefix()}|${packageName}`, async () => {
+        const memHit3 = memGet<Record<string, any>>(memKey);
+        if (memHit3) return memHit3;
+
+        try {
+          await this.ensureDiskCacheSubdir('metadata');
+          const diskHit = await this.readDiskCacheJson<Record<string, any>>(diskPath);
+          if (diskHit) {
+            memSet(memKey, diskHit, this.registryTtlMs);
+            return diskHit;
+          }
+        } catch {
+          // ignore disk cache read errors
+        }
+
+        const data = await this.fetchJson(url);
+        memSet(memKey, data, this.registryTtlMs);
+        await this.writeDiskCacheJson(diskPath, data, this.registryTtlMs);
+        return data;
+      });
+    });
   }
 
   private async getTarballUrl(packageObject: FhirPackageIdentifier): Promise<string> {
+    if (this.isRegistryDisabled()) {
+      throw new Error(this.formatRegistryDisabledMessage(
+        `Cannot download ${packageObject.id}@${packageObject.version}. Required packages must already exist in the package cache (${this.cachePath}).`
+      ));
+    }
+
+    if (!packageObject.version || packageObject.version.trim().length === 0) {
+      throw new Error(`Invalid package version for ${packageObject.id}`);
+    }
+
+    // A specific package version is immutable. Prefer a deterministic tarball URL.
+    // This avoids extra registry metadata calls, reducing rate-limit pressure.
     const isPrivateRegistry = this.registryUrl !== 'https://packages.fhir.org';
-    
-    // Always fetch package metadata for validation and version information
-    let packageData: Record<string, any>;
-    try {
-      packageData = await this.getPackageDataFromRegistry(packageObject.id);
-    } catch {
-      throw new Error(`Package ${packageObject.id} not found in the registry at ${this.registryUrl}.`);
-    }
-    
-    // Validate that the specific version exists
-    if (!packageObject.version || !packageData.versions?.[packageObject.version]) {
-      throw new Error(`Package ${packageObject.id}@${packageObject.version} not found in the registry at ${this.registryUrl}.`);
-    }
     
     // For private registries, construct the URL using the registry base (don't trust provided tarball URLs)
     if (isPrivateRegistry) {
       return `${this.registryUrl}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
     }
-    
-    // For the default registry, try to get the tarball URL from package metadata
-    const url = packageData.versions[packageObject.version!]?.dist?.tarball ?? packageData.versions[packageObject.version!]?.url;
-    if (!url) {
-      return `${this.fallbackUrlBase}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
-    }
-    return url;
+
+    // Default registry (packages.fhir.org) also supports the standard npm-style tarball URL format.
+    return `${this.registryUrl}/${packageObject.id}/-/${packageObject.id}-${packageObject.version}.tgz`;
   }
 
   private async downloadFile(url: string, destination: string): Promise<void> {
@@ -456,11 +866,55 @@ export class FhirPackageInstaller {
   private async downloadTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const tempDirectory = temp.mkdirSync();
     const tarballPath = path.join(tempDirectory, `${packageObject.id}-${packageObject.version}.tgz`);
-    const tarballUrl = await this.getTarballUrl(packageObject);
-    
-    this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
-    await this.downloadFile(tarballUrl, tarballPath);
+
+    const cached = await this.getOrDownloadDiskCachedTarball(packageObject);
+    await fs.copy(cached, tarballPath, { overwrite: true });
     return tarballPath;
+  }
+
+  private async getOrDownloadDiskCachedTarball(packageObject: FhirPackageIdentifier): Promise<string> {
+    const key = this.getDiskTarballCacheKey(packageObject);
+    const memKey = `tarball|${this.cachePath}|${key}`;
+
+    const memHit = memGet<string>(memKey);
+    if (memHit && await fs.exists(memHit)) return memHit;
+
+    return await withSingleFlight(inFlightTarball, memKey, async () => {
+      const memHit2 = memGet<string>(memKey);
+      if (memHit2 && await fs.exists(memHit2)) return memHit2;
+
+      return await this.withDiskLock(this.getDiskTarballCacheKey(packageObject), async () => {
+        const diskHit = await this.readDiskTarballCache(packageObject);
+        if (diskHit) {
+          memSetNoTtl(memKey, diskHit);
+          return diskHit;
+        }
+
+        const { tgzPath, donePath } = await this.getDiskTarballCachePaths(packageObject);
+        const tarballUrl = await this.getTarballUrl(packageObject);
+        this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
+
+        const tmp = `${tgzPath}.${process.pid}.${Date.now()}.tmp`;
+        await this.downloadFile(tarballUrl, tmp);
+
+        try {
+          await fs.move(tmp, tgzPath, { overwrite: false });
+        } catch (e: any) {
+          // Another process may have won the race. Prefer the existing file.
+          if (e?.code !== 'EEXIST') {
+            await fs.remove(tmp).catch(() => undefined);
+            throw e;
+          }
+          await fs.remove(tmp).catch(() => undefined);
+        }
+
+        // Mark completion so crashes don't leave a half-written cache entry.
+        await this.writeDiskTarballDoneMarker(donePath);
+
+        memSetNoTtl(memKey, tgzPath);
+        return tgzPath;
+      });
+    });
   }
 
   /**
@@ -469,9 +923,29 @@ export class FhirPackageInstaller {
    * @param src The source tarball, either a file path or a Readable stream.
    * @returns The path to the temporary directory where the package was extracted.
    */
-  private async extractTarball(src: string | Readable): Promise<string> {
+  private async extractTarball(src: string | Readable, options?: { packageObject?: FhirPackageIdentifier }): Promise<string> {
     const tarballStream: Readable = typeof src === 'string' ? fs.createReadStream(src) : src;
-    
+
+    const pkgObj = options?.packageObject;
+    let cachedIndex: PackageIndex | null = null;
+    if (pkgObj?.id && pkgObj?.version) {
+      try {
+        const memKey = this.getIndexMemKey(pkgObj);
+        cachedIndex = memGet<PackageIndex>(memKey);
+        if (!cachedIndex) {
+          const diskPath = this.getDiskIndexCachePath(pkgObj);
+          await this.ensureDiskCacheSubdir('indexes');
+          cachedIndex = await this.readDiskCacheJson<PackageIndex>(diskPath);
+          if (cachedIndex) {
+            memSetNoTtl(memKey, cachedIndex);
+          }
+        }
+      } catch {
+        cachedIndex = null;
+      }
+    }
+    const shouldParseForIndex = !cachedIndex;
+
     const indexEntries: FileInPackageIndex[] = [];
     const handleEntryPromises: Promise<void>[] = [];
 
@@ -577,6 +1051,7 @@ export class FhirPackageInstaller {
           .then(() => {
             // Only rate-limit/parallelize the *parsing*, not the draining.
             if (
+              shouldParseForIndex &&
               folderInTarball === 'package' &&
               fileName.endsWith('.json') &&
               fileName !== 'package.json' &&
@@ -652,31 +1127,30 @@ export class FhirPackageInstaller {
   
     const indexJson: PackageIndex = {
       'index-version': 2,
-      files: indexEntries
+      files: shouldParseForIndex ? indexEntries : (cachedIndex?.files || [])
     };
     await fs.writeJSON(path.join(tempDirectory, 'package', '.fpi.index.json'), indexJson);
+
+    // If we computed an index for a known package version, persist to memory + per-cachePath disk (best-effort)
+    if (shouldParseForIndex && pkgObj?.id && pkgObj?.version) {
+      try {
+        const memKey = this.getIndexMemKey(pkgObj);
+        memSetNoTtl(memKey, indexJson);
+        const diskPath = this.getDiskIndexCachePath(pkgObj);
+        await this.ensureDiskCacheSubdir('indexes');
+        await this.writeDiskCacheJsonNoTtl(diskPath, indexJson);
+      } catch {
+        // ignore
+      }
+    }
   
     this.logger.info('Extracted to a temporary directory');
     return tempDirectory;
   }
 
   private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
-    const tarballUrl = await this.getTarballUrl(packageObject);
-    this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
-    return await this.withRetries(async () => {
-      const tarballStream = await this.fetchStream(tarballUrl);
-      try {
-        return await this.extractTarball(tarballStream);
-      } catch (err) {
-        // Ensure the request stream is torn down between retries.
-        try {
-          tarballStream.destroy();
-        } catch {
-          // ignore
-        }
-        throw err;
-      }
-    });
+    const cachedTgzPath = await this.getOrDownloadDiskCachedTarball(packageObject);
+    return await this.extractTarball(cachedTgzPath, { packageObject });
   }
 
   /**
@@ -692,7 +1166,7 @@ export class FhirPackageInstaller {
     if (!await fs.exists(path.join(src, 'package'))) {
       finalPath = path.join(finalPath, 'package');
     }
-    const isInstalled = await this.isInstalled(packageObject);
+    const isInstalled = await this.isInstalled(packageObject, { deep: false });
     if (!isInstalled) {
       // try to move the temp dir to the cache, this will fail if pkg was already installed by a parallel process
       try {
@@ -722,8 +1196,53 @@ export class FhirPackageInstaller {
     return 'latest';
   }
 
-  public async isInstalled(packageId: FhirPackageIdentifier | string): Promise<boolean> {
-    return await fs.exists(await this.getPackageDirPath(packageId));
+  public async isInstalled(
+    packageId: FhirPackageIdentifier | string,
+    options?: { deep?: boolean }
+  ): Promise<boolean> {
+    const deep = options?.deep !== false;
+
+    // Avoid resolving "latest" via registry for unversioned string checks.
+    if (typeof packageId === 'string') {
+      const packageIdStr = packageId.trim();
+      if (packageIdStr.length === 0) {
+        return false;
+      }
+      const hasExplicitVersion = packageIdStr.includes('#') || packageIdStr.includes('@');
+      if (!hasExplicitVersion) {
+        const installedVersions = await this.getInstalledVersions(packageIdStr);
+        if (installedVersions.length === 0) return false;
+        const latestInstalled = installedVersions[0];
+        return await this.isInstalled({ id: packageIdStr, version: latestInstalled }, { deep });
+      }
+    }
+
+    const packageObject = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    const dirPath = await this.getPackageDirPath(packageObject);
+    if (!await fs.exists(dirPath)) {
+      return false;
+    }
+    if (!await this.packageManifestExists(packageObject)) {
+      return false;
+    }
+    if (!deep) {
+      return true;
+    }
+
+    try {
+      const missing = await this.collectMissingPackages(packageObject);
+      return missing.length === 0;
+    } catch (err: any) {
+      // Deep validation errors should not be silently swallowed.
+      // If we can't reliably validate dependencies due to infra / IO / parsing errors,
+      // surface the failure to the caller.
+      const code = err?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        // Treat common filesystem race conditions as "not installed".
+        return false;
+      }
+      throw err;
+    }
   }
 
   public async getPackageIndexFile(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
@@ -735,23 +1254,39 @@ export class FhirPackageInstaller {
   }
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
-    // Prefer a shared (disk) cache so multiple FPI instances/processes can avoid repeated registry calls.
-    const diskCached = await this.readLatestVersionFromDisk(packageName);
-    if (diskCached) {
-      return diskCached;
+    if (this.isRegistryDisabled()) {
+      throw new Error(this.formatRegistryDisabledMessage(
+        `Cannot resolve latest version for ${packageName}. Pin an explicit version in configuration.`
+      ));
     }
 
-    // Cache miss, fetch from registry
-    this.logger.info(`Fetching latest version for FHIR package ${packageName} from registry`);
-    const packageData = await this.getPackageDataFromRegistry(packageName);
-    const latest = packageData['dist-tags']?.latest;
-    if (!latest) {
-      throw new Error(`Package ${packageName} not found or has no latest version tag`);
+    // Latest is derived from the cached unversioned registry metadata (package document).
+    // This keeps caching policy consistent and avoids maintaining a second, redundant cache.
+    try {
+      this.logger.info(`Fetching latest version for FHIR package ${packageName} from registry`);
+      const packageData = await this.getPackageDataFromRegistry(packageName);
+      const latest = packageData['dist-tags']?.latest;
+      if (!latest) {
+        throw new Error(`Package ${packageName} not found or has no latest version tag`);
+      }
+      return latest;
+    } catch (onlineError: any) {
+      this.logger.warn(
+        `Failed to fetch latest version for ${packageName} from registry: ${onlineError?.message || onlineError}`
+      );
+
+      const installedVersions = await this.getInstalledVersions(packageName);
+      if (installedVersions.length === 0) {
+        throw new Error(
+          `Failed to resolve latest version for ${packageName} from registry (${onlineError?.message || onlineError}). ` +
+          `No installed versions found in cache (${this.cachePath}).`
+        );
+      }
+
+      const latestInstalled = installedVersions[0];
+      this.logger.warn(`Using latest installed version for ${packageName}: ${latestInstalled}`);
+      return latestInstalled;
     }
-    
-    // Store in shared (disk) cache
-    await this.writeLatestVersionToDisk(packageName, latest);
-    return latest;
   }
 
   public async toPackageObject(packageId: string | FhirPackageIdentifier): Promise<FhirPackageIdentifier> {
@@ -769,6 +1304,11 @@ export class FhirPackageInstaller {
       packageVersion = packageId.version || 'latest';
     }
     if (packageVersion === 'latest') {
+      if (this.isRegistryDisabled()) {
+        throw new Error(this.formatRegistryDisabledMessage(
+          `Cannot use the "latest" version feature for ${packageName}. Pin an explicit version (e.g., ${packageName}@x.y.z).`
+        ));
+      }
       packageVersion = await this.checkLatestPackageDist(packageName);
     }
     return { id: packageName, version: packageVersion };
@@ -835,60 +1375,6 @@ export class FhirPackageInstaller {
     }
   }
 
-  private sanitizeLatestCacheFileName(packageName: string): string {
-    // Package names should be safe, but ensure no path traversal / illegal characters.
-    // Keep dots to match requested format; replace path separators and Windows-illegal chars.
-    return packageName.replace(/[\\/]/g, '_').replace(/[<>:"|?*]/g, '_');
-  }
-
-  private getLatestVersionCacheFilePath(packageName: string): string {
-    const safeName = this.sanitizeLatestCacheFileName(packageName);
-    return path.join(this.cachePath, `.fpi.latest.${safeName}`);
-  }
-
-  private async readLatestVersionFromDisk(packageName: string): Promise<string | null> {
-    try {
-      const cacheFilePath = this.getLatestVersionCacheFilePath(packageName);
-      if (!await fs.exists(cacheFilePath)) {
-        return null;
-      }
-
-      const cacheData = await fs.readJSON(cacheFilePath, { encoding: 'utf8' });
-      const version = cacheData?.version;
-      const expiresAt = cacheData?.expiresAt;
-      if (typeof version !== 'string' || version.trim().length === 0) {
-        return null;
-      }
-      if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
-        return null;
-      }
-      if (Date.now() >= expiresAt) {
-        return null;
-      }
-
-      return version;
-    } catch {
-      // Ignore corrupted cache files; we'll fall back to online lookup.
-      return null;
-    }
-  }
-
-  private async writeLatestVersionToDisk(packageName: string, version: string): Promise<void> {
-    const cacheFilePath = this.getLatestVersionCacheFilePath(packageName);
-    const expiresAt = Date.now() + LATEST_VERSION_TTL_MS;
-
-    // Ensure cache root exists (it may not, if only getDependencies() is used).
-    await fs.ensureDir(this.cachePath);
-
-    // Best-effort write; don't fail installs if we can't persist the cache.
-    try {
-      const tempFilePath = `${cacheFilePath}.${process.pid}.${Date.now()}.tmp`;
-      await fs.writeJSON(tempFilePath, { version, expiresAt });
-      await fs.move(tempFilePath, cacheFilePath, { overwrite: true });
-    } catch {
-      // ignore
-    }
-  }
 
   /**
    * Resolve the latest version for an implicit package dependency
@@ -897,24 +1383,38 @@ export class FhirPackageInstaller {
    * @returns Resolved version or throws if no version found
    */
   private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
+    // Implicit packages are always "latest". If registry is disabled/offline, fall back to latest installed.
+    if (this.isRegistryDisabled()) {
+      this.logger.warn(
+        `Registry disabled; using latest installed version for implicit package ${packageName} (if available)`
+      );
+      const installedVersions = await this.getInstalledVersions(packageName);
+      if (installedVersions.length === 0) {
+        throw new Error(
+          `No version of implicit package ${packageName} found in cache (${this.cachePath}). Cannot start without a registry.`
+        );
+      }
+      const latestCached = installedVersions[0];
+      return latestCached;
+    }
+
     // Online-first (with shared disk cache), fallback to installed versions if registry is unavailable.
     try {
       return await this.checkLatestPackageDist(packageName);
     } catch (onlineError: any) {
-      this.logger.warn(`Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`);
-      
-      // Fallback to latest cached version
+      this.logger.warn(
+        `Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`
+      );
+
       const installedVersions = await this.getInstalledVersions(packageName);
       if (installedVersions.length === 0) {
-        throw new Error(`No version of implicit package ${packageName} found in cache. Cannot determine version to use.`);
+        throw new Error(
+          `No version of implicit package ${packageName} found in cache (${this.cachePath}). Cannot determine version to use.`
+        );
       }
-      
-      const latestCached = installedVersions[0]; // Already sorted with latest first
-      this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
 
-      // Update shared (disk) cache so other instances can reuse it.
-      await this.writeLatestVersionToDisk(packageName, latestCached);
-      
+      const latestCached = installedVersions[0];
+      this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
       return latestCached;
     }
   }
@@ -943,16 +1443,11 @@ export class FhirPackageInstaller {
     this.resolvingImplicitDeps.add(packageKey);
     
     try {
-      
-      // Resolve versions for each implicit dependency
+      // Resolve versions for each implicit dependency.
+      // If any implicit package can't be resolved (and isn't installed), we must fail startup.
       for (const implicitPackageId of implicitPackageIds) {
-        try {
-          const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
-          implicitDeps[implicitPackageId] = version;
-        } catch (e: any) {
-          this.logger.warn(`Failed to resolve implicit dependency ${implicitPackageId}: ${e?.message || e}`);
-          // Continue with other implicit dependencies rather than failing completely
-        }
+        const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
+        implicitDeps[implicitPackageId] = version;
       }
     } finally {
       // Always remove from tracking set
@@ -1008,6 +1503,20 @@ export class FhirPackageInstaller {
     } else {
       packageObject = packageId;
     }
+
+    // Registry disabled mode: never attempt downloads.
+    // All required packages (including transitive + implicit deps) must already exist.
+    if (this.isRegistryDisabled()) {
+      const missing = await this.collectMissingPackages(packageObject);
+      if (missing.length > 0) {
+        const preview = missing.slice(0, 10).join(', ');
+        const suffix = missing.length > 10 ? ` (and ${missing.length - 10} more)` : '';
+        throw new Error(this.formatRegistryDisabledMessage(
+          `Required packages are missing or incomplete in cache (${this.cachePath}). Missing: ${preview}${suffix}`
+        ));
+      }
+      return true;
+    }
     
     // Prevent circular installations
     const packageKey = `${packageObject.id}@${packageObject.version}`;
@@ -1015,8 +1524,15 @@ export class FhirPackageInstaller {
       return true;
     }
     
-    const alreadyInstalled = await this.isInstalled(packageObject);
-    if (!alreadyInstalled) {
+    // Only check that *this package* is present/complete.
+    // Transitive dependency installation is handled by installPackageDependencies().
+    const installedShallow = await this.isInstalled(packageObject, { deep: false });
+    if (!installedShallow) {
+      const dirPath = await this.getPackageDirPath(packageObject);
+      if (await fs.exists(dirPath)) {
+        // Clean up partial/corrupt installs so we can reinstall cleanly.
+        await fs.remove(dirPath);
+      }
       const tempPath = await this.downloadAndExtractTarball(packageObject);
       await this.cachePackage(packageObject, tempPath);
     }
@@ -1086,7 +1602,7 @@ export class FhirPackageInstaller {
       packageObject = { id: manifest.name, version: manifest.version };
     }
       
-    const alreadyInstalled = await this.isInstalled(packageObject);
+    const alreadyInstalled = await this.isInstalled(packageObject, { deep: false });
     if (alreadyInstalled && !options?.override) {
       this.logger.info(`Package ${packageObject.id}@${packageObject.version} is already installed`);
       return false;

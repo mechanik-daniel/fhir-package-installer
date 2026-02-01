@@ -1,6 +1,5 @@
 dist
 node_modules
-test/.dual-mode-cache
-test/.test-cache
+test/.dual-mode*
 test/downloaded-packages
-test/.test-cache-implicit
+test/.test-cache*

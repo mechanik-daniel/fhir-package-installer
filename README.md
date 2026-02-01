@@ -194,13 +194,13 @@ The implicit dependency resolver uses an **online-first, cache-fallback** strate
 
 ## FHIR Package Latest Version Caching
 
-To prevent HTTP 429 rate limiting errors when installing multiple FHIR packages or resolving many "latest" versions, FHIR Package Installer includes built-in latest version caching:
+To prevent HTTP 429 rate limiting errors when installing multiple FHIR packages or resolving many "latest" versions, FHIR Package Installer caches registry package metadata on disk and reuses it across processes:
 
 ### Default Behavior
-- **Automatic caching**: Latest versions are cached on disk in the package cache root
-- **Shared across processes**: Multiple `FhirPackageInstaller` instances (and even separate Node processes) reuse the same cached values
-- **Cache file format**: One file per package: `.fpi.latest.<packageName>` containing `{ version, expiresAt }`
-- **TTL**: Entries expire after 6 hours (best-effort; installs will still proceed if the cache file can't be written)
+- **Automatic caching**: Registry package documents are cached on disk under `.fpi.cache/metadata/`
+- **Shared across processes**: Multiple `FhirPackageInstaller` instances (and separate Node processes) reuse the same cached metadata when using the same `cachePath`
+- **Cache file format**: One file per package keyed by a stable hash, containing `{ expiresAt, data }` where `data['dist-tags'].latest` is used for "latest" resolution
+- **TTL**: Entries expire after 30 minutes by default (configurable via `registryTtlMs`; best-effort)
 
 ## FHIR Package Cache Directory
 
