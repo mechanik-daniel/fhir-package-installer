@@ -226,12 +226,11 @@ export class FhirPackageInstaller {
       registryTtlMs
     } = config || {} as FpiConfig;
     if (registryUrl) {
-      const normalized = registryUrl.trim().toLowerCase();
-      if (normalized === 'n/a') {
+      const normalized = registryUrl.trim();
+      this.registryUrl = registryUrl;
+      if (normalized.toLowerCase() === 'n/a') {
+        this.registryUrl = 'n/a';
         this.registryDisabled = true;
-        this.registryUrl = registryUrl;
-      } else {
-        this.registryUrl = registryUrl;
       }
     }
     if (registryToken) {
