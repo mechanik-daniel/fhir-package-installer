@@ -1158,7 +1158,7 @@ export class FhirPackageInstaller {
     if (!await fs.exists(path.join(src, 'package'))) {
       finalPath = path.join(finalPath, 'package');
     }
-    const isInstalled = await this.isInstalled(packageObject);
+    const isInstalled = await this.isInstalled(packageObject, { deep: false });
     if (!isInstalled) {
       // try to move the temp dir to the cache, this will fail if pkg was already installed by a parallel process
       try {
@@ -1224,8 +1224,16 @@ export class FhirPackageInstaller {
     try {
       const missing = await this.collectMissingPackages(packageObject);
       return missing.length === 0;
-    } catch {
-      return false;
+    } catch (err: any) {
+      // Deep validation errors should not be silently swallowed.
+      // If we can't reliably validate dependencies due to infra / IO / parsing errors,
+      // surface the failure to the caller.
+      const code = err?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        // Treat common filesystem race conditions as "not installed".
+        return false;
+      }
+      throw err;
     }
   }
 
@@ -1508,8 +1516,10 @@ export class FhirPackageInstaller {
       return true;
     }
     
-    const installedDeep = await this.isInstalled(packageObject);
-    if (!installedDeep) {
+    // Only check that *this package* is present/complete.
+    // Transitive dependency installation is handled by installPackageDependencies().
+    const installedShallow = await this.isInstalled(packageObject, { deep: false });
+    if (!installedShallow) {
       const dirPath = await this.getPackageDirPath(packageObject);
       if (await fs.exists(dirPath)) {
         // Clean up partial/corrupt installs so we can reinstall cleanly.
