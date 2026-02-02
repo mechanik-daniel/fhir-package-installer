@@ -825,6 +825,9 @@ export class FhirPackageInstaller {
           // ignore disk cache read errors
         }
 
+        // Only log when we are about to perform a real registry request.
+        // Cache hits (memory/disk) should remain silent to avoid console clutter.
+        this.logger.info(`Fetching registry metadata for FHIR package ${packageName} from ${this.registryUrl}`);
         const data = await this.fetchJson(url);
         memSet(memKey, data, this.registryTtlMs);
         await this.writeDiskCacheJson(diskPath, data, this.registryTtlMs);
@@ -1263,7 +1266,6 @@ export class FhirPackageInstaller {
     // Latest is derived from the cached unversioned registry metadata (package document).
     // This keeps caching policy consistent and avoids maintaining a second, redundant cache.
     try {
-      this.logger.info(`Fetching latest version for FHIR package ${packageName} from registry`);
       const packageData = await this.getPackageDataFromRegistry(packageName);
       const latest = packageData['dist-tags']?.latest;
       if (!latest) {
