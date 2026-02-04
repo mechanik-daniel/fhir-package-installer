@@ -281,22 +281,53 @@ export class FhirPackageInstaller {
    * For system services (daemons):
    * - Windows: %ProgramData%\.fhir\packages (typically C:\ProgramData\.fhir\packages)
    * - Unix/Linux: /var/lib/.fhir/packages
+   * 
+   * Behavior can be overridden via the FHIR_PACKAGE_CACHE_MODE environment variable:
+   * - FHIR_PACKAGE_CACHE_MODE=system -> always use system service paths
+   * - FHIR_PACKAGE_CACHE_MODE=user   -> always use user paths
    */
   private getDefaultCachePath(): string {
     const isWindows = process.platform === 'win32';
     const homeDir = os.homedir();
 
-    // Detect if running as a system service/daemon
-    // On Windows: Check if homedir ends with the SYSTEM profile path (no real user home)
-    // Using path.normalize() handles mixed separators and ensures consistent comparison
-    // On Unix: Check if running as root (uid 0) with no SUDO_USER (not sudo'd)
-    const normalizedHome = path.normalize(homeDir).toLowerCase();
-    const systemProfileSuffix = path
-      .normalize(path.join('Windows', 'System32', 'config', 'systemprofile'))
-      .toLowerCase();
-    const isSystemService = isWindows
-      ? normalizedHome.endsWith(systemProfileSuffix)
-      : (process.getuid?.() === 0 && !process.env.SUDO_USER);
+    // Allow explicit override of cache mode via environment variable
+    const cacheMode = process.env.FHIR_PACKAGE_CACHE_MODE?.toLowerCase();
+    let isSystemService: boolean;
+
+    if (cacheMode === 'system') {
+      isSystemService = true;
+    } else if (cacheMode === 'user') {
+      isSystemService = false;
+    } else {
+      // Detect if running as a system service/daemon
+      // On Windows: Check if homedir ends with the SYSTEM profile path (no real user home)
+      // Using path.normalize() handles mixed separators and ensures consistent comparison
+      // On Unix: Prefer a "daemon-like" heuristic rather than only checking for root:
+      //   - running as root (uid 0)
+      //   - not invoked via sudo (no SUDO_USER)
+      //   - missing common interactive-session variables (DISPLAY, SSH_CONNECTION, TERM)
+      if (isWindows) {
+        const normalizedHome = path.normalize(homeDir).toLowerCase();
+        const systemProfileSuffix = path
+          .normalize(path.join('Windows', 'System32', 'config', 'systemprofile'))
+          .toLowerCase();
+        isSystemService = normalizedHome.endsWith(systemProfileSuffix);
+      } else {
+        const isRoot = process.getuid?.() === 0;
+        const isSudo = !!process.env.SUDO_USER;
+        const hasDisplay = !!process.env.DISPLAY;
+        const hasSshConnection = !!process.env.SSH_CONNECTION;
+        const hasTerm = !!process.env.TERM;
+
+        isSystemService = Boolean(
+          isRoot &&
+          !isSudo &&
+          !hasDisplay &&
+          !hasSshConnection &&
+          !hasTerm
+        );
+      }
+    }
 
     if (isSystemService) {
       if (isWindows) {
