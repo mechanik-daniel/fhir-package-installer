@@ -17,49 +17,6 @@ import temp from 'temp';
 import os from 'os';
 import semver from 'semver';
 import crypto from 'crypto';
-
-/**
- * Determines the default FHIR package cache path based on FHIR specifications:
- * https://confluence.hl7.org/display/FHIR/FHIR+Package+Cache
- * 
- * For user applications:
- * - Windows: C:\Users\<username>\.fhir\packages
- * - Unix/Linux: ~/.fhir/packages
- * 
- * For system services (daemons):
- * - Windows: %ProgramData%\.fhir\packages (typically C:\ProgramData\.fhir\packages)
- * - Unix/Linux: /var/lib/.fhir/packages
- */
-function getDefaultCachePath(): string {
-  const isWindows = process.platform === 'win32';
-  const homeDir = os.homedir();
-
-  // Detect if running as a system service/daemon
-  // On Windows: Check if homedir ends with the SYSTEM profile path (no real user home)
-  // Using path.normalize() handles mixed separators and ensures consistent comparison
-  // On Unix: Check if running as root (uid 0) with no SUDO_USER (not sudo'd)
-  const normalizedHome = path.normalize(homeDir).toLowerCase();
-  const systemProfileSuffix = path
-    .normalize(path.join('Windows', 'System32', 'config', 'systemprofile'))
-    .toLowerCase();
-  const isSystemService = isWindows
-    ? normalizedHome.endsWith(systemProfileSuffix)
-    : (process.getuid?.() === 0 && !process.env.SUDO_USER);
-
-  if (isSystemService) {
-    if (isWindows) {
-      // Use ProgramData environment variable as per FHIR spec
-      const programData = process.env.ProgramData || 'C:\\ProgramData';
-      return path.join(programData, '.fhir', 'packages');
-    } else {
-      // Unix/Linux daemon location
-      return '/var/lib/.fhir/packages';
-    }
-  }
-
-  // Standard user location
-  return path.join(homeDir, '.fhir', 'packages');
-}
  
 
 import type {
@@ -272,7 +229,12 @@ export class FhirPackageInstaller {
       registryTtlMs
     } = config || {} as FpiConfig;
 
-    this.cachePath = cachePath ?? getDefaultCachePath();
+    // Set logger first so getDefaultCachePath() can use it for warnings
+    if (logger) {
+      this.logger = logger;
+    }
+
+    this.cachePath = cachePath ?? this.getDefaultCachePath();
 
     if (registryUrl) {
       const normalized = registryUrl.trim();
@@ -303,12 +265,83 @@ export class FhirPackageInstaller {
     if (typeof effectiveRegistryTtlMs === 'number') {
       this.registryTtlMs = effectiveRegistryTtlMs;
     }
-    if (logger) {
-      this.logger = logger;
-    }
     if (skipExamples) {
       this.skipExamples = skipExamples;
     }
+  }
+
+  /**
+   * Determines the default FHIR package cache path based on FHIR specifications:
+   * https://confluence.hl7.org/display/FHIR/FHIR+Package+Cache
+   * 
+   * For user applications:
+   * - Windows: C:\Users\<username>\.fhir\packages
+   * - Unix/Linux: ~/.fhir/packages
+   * 
+   * For system services (daemons):
+   * - Windows: %ProgramData%\.fhir\packages (typically C:\ProgramData\.fhir\packages)
+   * - Unix/Linux: /var/lib/.fhir/packages
+   */
+  private getDefaultCachePath(): string {
+    const isWindows = process.platform === 'win32';
+    const homeDir = os.homedir();
+
+    // Detect if running as a system service/daemon
+    // On Windows: Check if homedir ends with the SYSTEM profile path (no real user home)
+    // Using path.normalize() handles mixed separators and ensures consistent comparison
+    // On Unix: Check if running as root (uid 0) with no SUDO_USER (not sudo'd)
+    const normalizedHome = path.normalize(homeDir).toLowerCase();
+    const systemProfileSuffix = path
+      .normalize(path.join('Windows', 'System32', 'config', 'systemprofile'))
+      .toLowerCase();
+    const isSystemService = isWindows
+      ? normalizedHome.endsWith(systemProfileSuffix)
+      : (process.getuid?.() === 0 && !process.env.SUDO_USER);
+
+    if (isSystemService) {
+      if (isWindows) {
+        // Use ProgramData environment variable as per FHIR spec.
+        // If ProgramData is not set, fall back to "C:\\ProgramData" if it exists and is writable;
+        // otherwise fall back to user home directory.
+        let programData = process.env.ProgramData;
+
+        if (!programData || programData.trim() === '') {
+          const fallbackProgramData = 'C:\\ProgramData';
+          try {
+            if (fs.pathExistsSync(fallbackProgramData)) {
+              fs.accessSync(fallbackProgramData, fs.constants.W_OK);
+              this.logger.warn(
+                'ProgramData environment variable is not set; ' +
+                'using fallback "C:\\ProgramData" for system service cache directory.'
+              );
+              programData = fallbackProgramData;
+            } else {
+              this.logger.warn(
+                'ProgramData environment variable is not set and ' +
+                'fallback "C:\\ProgramData" does not exist. Falling back to user cache directory.'
+              );
+            }
+          } catch {
+            this.logger.warn(
+              'ProgramData environment variable is not set and ' +
+              'fallback "C:\\ProgramData" is not writable. Falling back to user cache directory.'
+            );
+          }
+        }
+
+        if (programData) {
+          return path.join(programData, '.fhir', 'packages');
+        }
+        // ProgramData unavailable or not writable - use user home
+        return path.join(homeDir, '.fhir', 'packages');
+      } else {
+        // Unix/Linux daemon location
+        return '/var/lib/.fhir/packages';
+      }
+    }
+
+    // Standard user location
+    return path.join(homeDir, '.fhir', 'packages');
   }
 
   private async withDiskLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
