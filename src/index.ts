@@ -17,6 +17,44 @@ import temp from 'temp';
 import os from 'os';
 import semver from 'semver';
 import crypto from 'crypto';
+
+/**
+ * Determines the default FHIR package cache path based on FHIR specifications:
+ * https://confluence.hl7.org/display/FHIR/FHIR+Package+Cache
+ * 
+ * For user applications:
+ * - Windows: C:\Users\<username>\.fhir\packages
+ * - Unix/Linux: ~/.fhir/packages
+ * 
+ * For system services (daemons):
+ * - Windows: %ProgramData%\.fhir\packages (typically C:\ProgramData\.fhir\packages)
+ * - Unix/Linux: /var/lib/.fhir/packages
+ */
+function getDefaultCachePath(): string {
+  const isWindows = process.platform === 'win32';
+  const homeDir = os.homedir();
+
+  // Detect if running as a system service/daemon
+  // On Windows: Check if homedir is the SYSTEM profile (no real user home)
+  // On Unix: Check if running as root (uid 0) with no SUDO_USER (not sudo'd)
+  const isSystemService = isWindows
+    ? homeDir.toLowerCase().includes('\\system32\\config\\systemprofile')
+    : (process.getuid?.() === 0 && !process.env.SUDO_USER);
+
+  if (isSystemService) {
+    if (isWindows) {
+      // Use ProgramData environment variable as per FHIR spec
+      const programData = process.env.ProgramData || 'C:\\ProgramData';
+      return path.join(programData, '.fhir', 'packages');
+    } else {
+      // Unix/Linux daemon location
+      return '/var/lib/.fhir/packages';
+    }
+  }
+
+  // Standard user location
+  return path.join(homeDir, '.fhir', 'packages');
+}
  
 
 import type {
@@ -206,8 +244,11 @@ export class FhirPackageInstaller {
    * Path to the FHIR package cache directory.
    * This directory is used to store downloaded and extracted FHIR packages.
    * If the directory does not exist, it will be created.
+   * Default location follows FHIR spec:
+   * - User apps: ~/.fhir/packages (Windows: C:\Users\<user>\.fhir\packages)
+   * - System services: /var/lib/.fhir/packages (Windows: %ProgramData%\.fhir\packages)
    */
-  private cachePath: string = path.join(os.homedir(), '.fhir', 'packages');
+  private cachePath: string = getDefaultCachePath();
   private skipExamples = false; // skip dependency installation of example packages
   private allowHttp = false; // allow HTTP URLs for testing
   private resolvingImplicitDeps = new Set<string>();

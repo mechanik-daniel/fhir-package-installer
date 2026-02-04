@@ -210,20 +210,24 @@ Location of the default global package cache differs per operating system.
 
 Windows: 
 ```
-c:\users\<username>\.fhir\packages
+C:\Users\<username>\.fhir\packages
 ```
 
 Unix/Linux: 
 ```
-/~/.fhir/packages
+~/.fhir/packages
 ```
 
 ### For system services (daemons):
 
 Windows: 
 ```
-C:\Windows\System32\config\systemprofile\.fhir\packages
+%ProgramData%\.fhir\packages
 ```
+(typically `C:\ProgramData\.fhir\packages`)
+
+Note: The package cache uses the location indicated by the `ProgramData` environment variable.
+
 Unix/Linux: 
 ```
 /var/lib/.fhir/packages
