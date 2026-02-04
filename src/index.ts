@@ -253,7 +253,7 @@ export class FhirPackageInstaller {
    * - User apps: ~/.fhir/packages (Windows: C:\Users\<user>\.fhir\packages)
    * - System services: /var/lib/.fhir/packages (Windows: %ProgramData%\.fhir\packages)
    */
-  private cachePath: string = getDefaultCachePath();
+  private cachePath!: string;
   private skipExamples = false; // skip dependency installation of example packages
   private allowHttp = false; // allow HTTP URLs for testing
   private resolvingImplicitDeps = new Set<string>();
@@ -271,6 +271,9 @@ export class FhirPackageInstaller {
       extractTimeoutMs,
       registryTtlMs
     } = config || {} as FpiConfig;
+
+    this.cachePath = cachePath ?? getDefaultCachePath();
+
     if (registryUrl) {
       const normalized = registryUrl.trim();
       this.registryUrl = registryUrl;
@@ -281,9 +284,6 @@ export class FhirPackageInstaller {
     }
     if (registryToken) {
       this.registryToken = registryToken;
-    }
-    if (cachePath) {
-      this.cachePath = cachePath;
     }
     if (allowHttp) {
       this.allowHttp = allowHttp;
