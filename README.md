@@ -210,24 +210,37 @@ Location of the default global package cache differs per operating system.
 
 Windows: 
 ```
-c:\users\<username>\.fhir\packages
+C:\Users\<username>\.fhir\packages
 ```
 
 Unix/Linux: 
 ```
-/~/.fhir/packages
+~/.fhir/packages
 ```
 
 ### For system services (daemons):
 
 Windows: 
 ```
-C:\Windows\System32\config\systemprofile\.fhir\packages
+%ProgramData%\.fhir\packages
 ```
+(typically `C:\ProgramData\.fhir\packages`)
+
+Note: The package cache uses the location indicated by the `ProgramData` environment variable.
+
 Unix/Linux: 
 ```
 /var/lib/.fhir/packages
 ```  
+
+### Overriding Cache Mode
+
+The automatic detection of user vs. system service context can be overridden via the `FHIR_PACKAGE_CACHE_MODE` environment variable:
+
+- `FHIR_PACKAGE_CACHE_MODE=system` - Force use of system service paths
+- `FHIR_PACKAGE_CACHE_MODE=user` - Force use of user paths
+
+This is useful in containerized environments or when the automatic detection doesn't match your deployment scenario.
 
 ### Folder Structure
 The package cache root folder contains a folder per package where the folder name is the package name, a pound and the package version:
