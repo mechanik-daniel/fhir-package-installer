@@ -35,10 +35,15 @@ function getDefaultCachePath(): string {
   const homeDir = os.homedir();
 
   // Detect if running as a system service/daemon
-  // On Windows: Check if homedir is the SYSTEM profile (no real user home)
+  // On Windows: Check if homedir ends with the SYSTEM profile path (no real user home)
+  // Using path.normalize() handles mixed separators and ensures consistent comparison
   // On Unix: Check if running as root (uid 0) with no SUDO_USER (not sudo'd)
+  const normalizedHome = path.normalize(homeDir).toLowerCase();
+  const systemProfileSuffix = path
+    .normalize(path.join('Windows', 'System32', 'config', 'systemprofile'))
+    .toLowerCase();
   const isSystemService = isWindows
-    ? homeDir.toLowerCase().includes('\\system32\\config\\systemprofile')
+    ? normalizedHome.endsWith(systemProfileSuffix)
     : (process.getuid?.() === 0 && !process.env.SUDO_USER);
 
   if (isSystemService) {
