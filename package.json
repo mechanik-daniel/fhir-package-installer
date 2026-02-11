@@ -62,8 +62,8 @@
   },
   "dependencies": {
     "fs-extra": "^11.3.3",
-    "p-limit": "^6.2.0",
-    "semver": "^7.7.3",
+    "p-limit": "^7.3.0",
+    "semver": "^7.7.4",
     "tar-stream": "^3.1.7"
   },
   "devDependencies": {
