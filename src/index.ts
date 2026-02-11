@@ -13,7 +13,6 @@ import { Readable } from 'stream';
 import { finished, pipeline } from 'stream/promises';
 import * as tar from 'tar-stream';
 import * as zlib from 'zlib';
-import temp from 'temp';
 import os from 'os';
 import semver from 'semver';
 import crypto from 'crypto';
@@ -33,7 +32,30 @@ import type {
 } from './types';
 import { Logger, FhirPackageIdentifier } from '@outburn/types';
 
-temp.track();
+const tempDirs = new Set<string>();
+let tempCleanupRegistered = false;
+
+const registerTempCleanup = (): void => {
+  if (tempCleanupRegistered) return;
+  tempCleanupRegistered = true;
+  process.once('exit', () => {
+    for (const dir of tempDirs) {
+      try {
+        fs.removeSync(dir);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    tempDirs.clear();
+  });
+};
+
+const createTempDir = (): string => {
+  registerTempCleanup();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fhir-package-installer-'));
+  tempDirs.add(dir);
+  return dir;
+};
 
 // NOTE: This is injected at build time via tsup `define` (see tsup.config.ts).
 // It must NOT be read from package.json at runtime (supports SEA/bundling scenarios).
@@ -977,7 +999,7 @@ export class FhirPackageInstaller {
   }
 
   private async downloadTarball(packageObject: FhirPackageIdentifier): Promise<string> {
-    const tempDirectory = temp.mkdirSync();
+    const tempDirectory = createTempDir();
     const tarballPath = path.join(tempDirectory, `${packageObject.id}-${packageObject.version}.tgz`);
 
     const cached = await this.getOrDownloadDiskCachedTarball(packageObject);
@@ -1062,7 +1084,7 @@ export class FhirPackageInstaller {
     const indexEntries: FileInPackageIndex[] = [];
     const handleEntryPromises: Promise<void>[] = [];
 
-    const tempDirectory = temp.mkdirSync();
+    const tempDirectory = createTempDir();
     this.logger.info(`Extracting package to ${tempDirectory}`);
     const extract = tar.extract();
 

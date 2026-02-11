@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import path from 'path';
-import temp from 'temp';
 import fs from 'fs-extra';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
@@ -9,6 +8,7 @@ import type { FileInPackageIndex } from 'fhir-package-installer';
 import type { Logger } from '@outburn/types';
 
 import { createLocalRegistryServer, createTgzBuffer } from './local-registry-server';
+import { createTempDir } from './temp-dir';
 
 const noopLogger: Logger = {
   info: () => {},
@@ -20,8 +20,6 @@ const noopLogger: Logger = {
 function sortIndexEntries(entries: FileInPackageIndex[]): FileInPackageIndex[] {
   return entries.slice().sort((a, b) => a.filename.localeCompare(b.filename));
 }
-
-temp.track();
 
 // Keep this for quickly toggling a few edge-case tests while iterating locally.
 const skip = false;
@@ -270,7 +268,7 @@ describe('fhir-package-installer module', () => {
     });
     
     it('download only - custom path - absolute', { timeout: TIMEOUT }, async () => {
-      const tempDirectory = temp.mkdirSync();
+      const tempDirectory = createTempDir();
       const downloadedPath = await testFpi.downloadPackage(testPkg, { destination: tempDirectory });
       expect(downloadedPath).toBe(path.join(tempDirectory, `${testPkg.id}-${testPkg.version}.tgz`));
       expect(fs.existsSync(downloadedPath)).toBe(true);

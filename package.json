@@ -64,8 +64,7 @@
     "fs-extra": "^11.3.3",
     "p-limit": "^6.2.0",
     "semver": "^7.7.3",
-    "tar-stream": "^3.1.7",
-    "temp": "^0.9.4"
+    "tar-stream": "^3.1.7"
   },
   "devDependencies": {
     "@eslint/js": "^9.24.0",

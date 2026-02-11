@@ -1,10 +1,11 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import path from 'path';
-import temp from 'temp';
 import fs from 'fs-extra';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { Logger } from '@outburn/types';
 import { DualModeTestRunner, type TestContext } from './dual-mode-test-runner.js';
 import { createLocalRegistryServer, createTgzBuffer } from './local-registry-server';
+import { createTempDir } from './temp-dir';
 
 const noopLogger: Logger = {
   info: () => {},
@@ -17,8 +18,6 @@ const debugLogger: Logger = {
   warn: (msg) => console.warn('[WARN]', msg),
   error: (msg) => console.error('[ERROR]', msg)
 };
-
-temp.track();
 
 const TIMEOUT = 240000; // 240 seconds timeout for installation
 
@@ -167,7 +166,7 @@ describe('FHIR Package Installer - Dual Mode Tests (Direct + Artifactory)', () =
       const results = await DualModeTestRunner.runInBothModes(
         async (context: TestContext) => {
           // Download package which tests redirect handling
-          const tempDir = temp.mkdirSync();
+          const tempDir = createTempDir();
           const downloadPath = await context.fpi.downloadPackage(
             testPkg, 
             { destination: tempDir, extract: false }
