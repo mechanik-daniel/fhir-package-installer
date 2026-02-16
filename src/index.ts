@@ -256,7 +256,19 @@ export class FhirPackageInstaller {
       this.logger = logger;
     }
 
-    this.cachePath = cachePath ?? this.getDefaultCachePath();
+    const normalizedCachePath = ((): string | undefined => {
+      if (typeof cachePath !== 'string') {
+        return cachePath as any;
+      }
+      const trimmed = cachePath.trim();
+      if (trimmed === '' || trimmed.toLowerCase() === 'n/a') {
+        this.logger.warn?.('Empty cachePath provided; falling back to FHIR spec default cache path.');
+        return undefined;
+      }
+      return trimmed;
+    })();
+
+    this.cachePath = normalizedCachePath ?? this.getDefaultCachePath();
 
     if (registryUrl) {
       const normalized = registryUrl.trim();
