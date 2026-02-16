@@ -33,4 +33,14 @@ describe('FhirPackageInstaller default cache path', () => {
     const fpi = new FhirPackageInstaller({ cachePath: '   ' });
     expect(fpi.getCachePath()).toBe(path.join(os.homedir(), '.fhir', 'packages'));
   });
+
+  test("Uses FHIR spec default when cachePath is 'n/a'", () => {
+    const fpi = new FhirPackageInstaller({ cachePath: 'n/a' });
+    expect(fpi.getCachePath()).toBe(path.join(os.homedir(), '.fhir', 'packages'));
+  });
+
+  test("Uses FHIR spec default when cachePath is 'N/A'", () => {
+    const fpi = new FhirPackageInstaller({ cachePath: 'N/A' });
+    expect(fpi.getCachePath()).toBe(path.join(os.homedir(), '.fhir', 'packages'));
+  });
 });
