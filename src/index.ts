@@ -257,12 +257,20 @@ export class FhirPackageInstaller {
     }
 
     const normalizedCachePath = ((): string | undefined => {
+      if (cachePath == null) {
+        return undefined;
+      }
       if (typeof cachePath !== 'string') {
-        return cachePath as any;
+        this.logger.warn?.(
+          `Non-string cachePath provided (${typeof cachePath}); falling back to FHIR spec default cache path.`
+        );
+        return undefined;
       }
       const trimmed = cachePath.trim();
       if (trimmed === '' || trimmed.toLowerCase() === 'n/a') {
-        this.logger.warn?.('Empty cachePath provided; falling back to FHIR spec default cache path.');
+        this.logger.warn?.(
+          'Non-usable cachePath provided (empty/whitespace or "n/a"); falling back to FHIR spec default cache path.'
+        );
         return undefined;
       }
       return trimmed;
