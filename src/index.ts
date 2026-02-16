@@ -691,7 +691,7 @@ export class FhirPackageInstaller {
    */
   private async generatePackageIndex(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
     const pckIdObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
-    this.logger.info(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
+    this.logger.debug?.(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
     const packagePath = await this.getPackageDirPath(pckIdObj);
     const indexPath = await this.getPackageIndexPath(pckIdObj);
 
@@ -822,7 +822,7 @@ export class FhirPackageInstaller {
           const displayUrl = redirectTarget.length > 64 
             ? `${redirectTarget.substring(0, 64)}...` 
             : redirectTarget;
-          this.logger.info(`Following redirect from ${url} to ${displayUrl}`);
+          this.logger.debug?.(`Following redirect from ${url} to ${displayUrl}`);
           // Recursively follow the redirect
           this.fetchJson(res.headers.location, redirectCount + 1)
             .then(resolve)
@@ -907,7 +907,7 @@ export class FhirPackageInstaller {
           const displayUrl = redirectTarget.length > 64 
             ? `${redirectTarget.substring(0, 64)}...` 
             : redirectTarget;
-          this.logger.info(`Following redirect from ${url} to ${displayUrl}`);
+          this.logger.debug?.(`Following redirect from ${url} to ${displayUrl}`);
           // Recursively follow the redirect
           this.fetchStream(res.headers.location, redirectCount + 1)
             .then(resolve)
@@ -979,7 +979,7 @@ export class FhirPackageInstaller {
 
         // Only log when we are about to perform a real registry request.
         // Cache hits (memory/disk) should remain silent to avoid console clutter.
-        this.logger.info(`Fetching registry metadata for FHIR package ${packageName} from ${this.registryUrl}`);
+        this.logger.debug?.(`Fetching registry metadata for FHIR package ${packageName} from ${this.registryUrl}`);
         const data = await this.fetchJson(url);
         memSet(memKey, data, this.registryTtlMs);
         await this.writeDiskCacheJson(diskPath, data, this.registryTtlMs);
@@ -1047,7 +1047,7 @@ export class FhirPackageInstaller {
 
         const { tgzPath, donePath } = await this.getDiskTarballCachePaths(packageObject);
         const tarballUrl = await this.getTarballUrl(packageObject);
-        this.logger.info(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
+        this.logger.debug?.(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
 
         const tmp = `${tgzPath}.${process.pid}.${Date.now()}.tmp`;
         await this.downloadFile(tarballUrl, tmp);
@@ -1105,7 +1105,7 @@ export class FhirPackageInstaller {
     const handleEntryPromises: Promise<void>[] = [];
 
     const tempDirectory = createTempDir();
-    this.logger.info(`Extracting package to ${tempDirectory}`);
+    this.logger.debug?.(`Extracting package to ${tempDirectory}`);
     const extract = tar.extract();
 
     // Inactivity timeout: reset whenever we see extraction progress (data or entry completion).
@@ -1149,7 +1149,7 @@ export class FhirPackageInstaller {
     let completedEntries = 0;
     const progressLogIntervalMs = 30000;
     const progressLogHandle = setInterval(() => {
-      this.logger.info(`Extracting package... completed ${completedEntries} entries so far`);
+      this.logger.debug?.(`Extracting package... completed ${completedEntries} entries so far`);
     }, progressLogIntervalMs);
     // Don't keep the process alive only for progress logging
     (progressLogHandle as any).unref?.();
@@ -1299,7 +1299,7 @@ export class FhirPackageInstaller {
       }
     }
   
-    this.logger.info('Extracted to a temporary directory');
+    this.logger.debug?.('Extracted to a temporary directory');
     return tempDirectory;
   }
 
