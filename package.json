@@ -68,7 +68,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@outburn/types": "^0.1.0",
+    "@outburn/types": "^0.2.0",
     "@types/fs-extra": "^11.0.4",
     "@types/semver": "^7.7.1",
     "@types/tar-stream": "^3.1.4",
