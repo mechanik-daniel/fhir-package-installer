@@ -102,6 +102,53 @@ const DEFAULT_REGISTRY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 // Process-wide in-memory cache sizing
 const MEM_CACHE_MAX_ENTRIES = 500;
 
+type BoundedTtlEntry<V> = {
+  value: V;
+  expiresAt: number;
+};
+
+// Lightweight bounded TTL cache with LRU-ish behavior via Map insertion order.
+class BoundedTtlCache<K, V> {
+  private readonly maxEntries: number;
+  private readonly map = new Map<K, BoundedTtlEntry<V>>();
+
+  constructor(maxEntries: number) {
+    this.maxEntries = maxEntries;
+  }
+
+  get(key: K): V | undefined {
+    const entry = this.map.get(key);
+    if (!entry) return undefined;
+    if (Date.now() >= entry.expiresAt) {
+      this.map.delete(key);
+      return undefined;
+    }
+    // Touch for LRU-ish behavior.
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: K, value: V, ttlMs: number): void {
+    const expiresAt = Date.now() + ttlMs;
+    const entry: BoundedTtlEntry<V> = { value, expiresAt };
+
+    // Touch for LRU-ish behavior.
+    this.map.delete(key);
+    this.map.set(key, entry);
+
+    while (this.map.size > this.maxEntries) {
+      const firstKey = this.map.keys().next().value as K | undefined;
+      if (firstKey === undefined) break;
+      this.map.delete(firstKey);
+    }
+  }
+
+  delete(key: K): boolean {
+    return this.map.delete(key);
+  }
+}
+
 // ---- Module-level (process-wide) single-flight maps ----
 // These are intentionally module-scoped so multiple FhirPackageInstaller instances within
 // the same Node process coordinate and don't duplicate work.
@@ -112,11 +159,11 @@ const inFlightImplicitEffectiveVersion = new Map<string, Promise<string>>();
 
 // Process-wide cache for implicit package effective versions.
 // Keyed by {registryUrl, cachePath, packageId} so different installer configs don't bleed into each other.
-const implicitEffectiveVersionCache = new Map<string, string>();
+const implicitEffectiveVersionCache = new BoundedTtlCache<string, string>(MEM_CACHE_MAX_ENTRIES);
 
 // Process-wide cache for implicit package resolution failures.
 // Keyed the same way as the winner cache so repeated downstream calls can surface a stable error.
-const implicitResolutionFailureCache = new Map<string, Error>();
+const implicitResolutionFailureCache = new BoundedTtlCache<string, Error>(MEM_CACHE_MAX_ENTRIES);
 
 class ImplicitPackageResolutionError extends Error {
   public readonly packageId: string;
@@ -186,7 +233,7 @@ class FhirPackageInstallError extends Error {
     const meta = `step=${args.step} registryUrl=${args.registryUrl} cachePath=${args.cachePath}`;
     const tarball = args.tarballUrl ? ` tarballUrl=${args.tarballUrl}` : '';
     const causeText = args.cause ? ` Cause: ${safe(args.cause)}` : '';
-    super(`Failed to install ${pkg}. ${meta}.${tarball}${causeText}`);
+    super(`Failed to install ${pkg}. ${meta}.${tarball}${causeText}`, { cause: args.cause });
     this.name = 'FhirPackageInstallError';
     this.packageId = args.packageId;
     this.version = args.version;
@@ -194,7 +241,6 @@ class FhirPackageInstallError extends Error {
     this.cachePath = args.cachePath;
     this.step = args.step;
     this.tarballUrl = args.tarballUrl;
-    (this as any).cause = args.cause;
   }
 }
 
@@ -1150,6 +1196,7 @@ export class FhirPackageInstaller {
         try {
           await this.downloadFile(tarballUrl, tmp);
         } catch (e: any) {
+          await fs.remove(tmp).catch(() => undefined);
           if (e instanceof FhirPackageInstallError) throw e;
           throw new FhirPackageInstallError({
             packageId: packageObject.id,
@@ -1731,7 +1778,7 @@ export class FhirPackageInstaller {
               const ok = await this.isInstalled({ id: packageName, version: v }, { deep: false });
               if (ok) {
                 implicitResolutionFailureCache.delete(cacheKey);
-                implicitEffectiveVersionCache.set(cacheKey, v);
+                implicitEffectiveVersionCache.set(cacheKey, v, this.registryTtlMs);
                 return v;
               }
             } catch (e: any) {
@@ -1793,7 +1840,7 @@ export class FhirPackageInstaller {
             const alreadyOk = await this.isInstalled(pkgObj, { deep: false });
             if (alreadyOk) {
               implicitResolutionFailureCache.delete(cacheKey);
-              implicitEffectiveVersionCache.set(cacheKey, version);
+              implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
               return version;
             }
 
@@ -1801,7 +1848,7 @@ export class FhirPackageInstaller {
             const okAfterInstall = await this.isInstalled(pkgObj, { deep: false });
             if (okAfterInstall) {
               implicitResolutionFailureCache.delete(cacheKey);
-              implicitEffectiveVersionCache.set(cacheKey, version);
+              implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
               return version;
             }
             causes.push(`${version}: install completed but manifest missing`);
@@ -1819,7 +1866,7 @@ export class FhirPackageInstaller {
         });
       } catch (e: any) {
         if (e instanceof ImplicitPackageResolutionError) {
-          implicitResolutionFailureCache.set(cacheKey, e);
+          implicitResolutionFailureCache.set(cacheKey, e, this.registryTtlMs);
         }
         throw e;
       }
