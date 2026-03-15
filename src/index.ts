@@ -88,11 +88,66 @@ const IMPLICIT_DEPENDENCIES_MAP: Record<string, string[]> = {
   ]
 };
 
+const IMPLICIT_PACKAGE_IDS = (() => {
+  const s = new Set<string>();
+  for (const ids of Object.values(IMPLICIT_DEPENDENCIES_MAP)) {
+    for (const id of ids) s.add(id);
+  }
+  return s;
+})();
+
 // TTL for cached registry lookups (stored under `cachePath`)
 const DEFAULT_REGISTRY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Process-wide in-memory cache sizing
 const MEM_CACHE_MAX_ENTRIES = 500;
+
+type BoundedTtlEntry<V> = {
+  value: V;
+  expiresAt: number;
+};
+
+// Lightweight bounded TTL cache with LRU-ish behavior via Map insertion order.
+class BoundedTtlCache<K, V> {
+  private readonly maxEntries: number;
+  private readonly map = new Map<K, BoundedTtlEntry<V>>();
+
+  constructor(maxEntries: number) {
+    this.maxEntries = maxEntries;
+  }
+
+  get(key: K): V | undefined {
+    const entry = this.map.get(key);
+    if (!entry) return undefined;
+    if (Date.now() >= entry.expiresAt) {
+      this.map.delete(key);
+      return undefined;
+    }
+    // Touch for LRU-ish behavior.
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: K, value: V, ttlMs: number): void {
+    const expiresAt = Date.now() + ttlMs;
+    const entry: BoundedTtlEntry<V> = { value, expiresAt };
+
+    // Touch for LRU-ish behavior.
+    this.map.delete(key);
+    this.map.set(key, entry);
+
+    while (this.map.size > this.maxEntries) {
+      const firstKey = this.map.keys().next().value as K | undefined;
+      if (firstKey === undefined) break;
+      this.map.delete(firstKey);
+    }
+  }
+
+  delete(key: K): boolean {
+    return this.map.delete(key);
+  }
+}
 
 // ---- Module-level (process-wide) single-flight maps ----
 // These are intentionally module-scoped so multiple FhirPackageInstaller instances within
@@ -100,6 +155,94 @@ const MEM_CACHE_MAX_ENTRIES = 500;
 const inFlightJson = new Map<string, Promise<any>>();
 const inFlightTarball = new Map<string, Promise<string>>();
 const inFlightIndex = new Map<string, Promise<PackageIndex>>();
+const inFlightImplicitEffectiveVersion = new Map<string, Promise<string>>();
+
+// Process-wide cache for implicit package effective versions.
+// Keyed by {registryUrl, cachePath, packageId} so different installer configs don't bleed into each other.
+const implicitEffectiveVersionCache = new BoundedTtlCache<string, string>(MEM_CACHE_MAX_ENTRIES);
+
+// Process-wide cache for implicit package resolution failures.
+// Keyed the same way as the winner cache so repeated downstream calls can surface a stable error.
+const implicitResolutionFailureCache = new BoundedTtlCache<string, Error>(MEM_CACHE_MAX_ENTRIES);
+
+class ImplicitPackageResolutionError extends Error {
+  public readonly packageId: string;
+  public readonly attemptedVersions: string[];
+  public readonly registryUrl: string;
+  public readonly cachePath: string;
+  public readonly causes: string[];
+
+  constructor(args: {
+    packageId: string;
+    attemptedVersions: string[];
+    registryUrl: string;
+    cachePath: string;
+    causes?: string[];
+  }) {
+    const attempted = args.attemptedVersions.length > 0 ? args.attemptedVersions.join(', ') : '(none)';
+    const prefix = `Failed to resolve implicit package ${args.packageId}`;
+    const meta = `attemptedVersions=[${attempted}] registryUrl=${args.registryUrl} cachePath=${args.cachePath}`;
+    const causeText = (args.causes && args.causes.length > 0)
+      ? ` causes=[${args.causes.join(' | ')}]`
+      : '';
+    super(`${prefix}. ${meta}.${causeText}`);
+    this.name = 'ImplicitPackageResolutionError';
+    this.packageId = args.packageId;
+    this.attemptedVersions = args.attemptedVersions;
+    this.registryUrl = args.registryUrl;
+    this.cachePath = args.cachePath;
+    this.causes = args.causes ?? [];
+  }
+}
+
+type FhirPackageInstallStep =
+  | 'download-tarball'
+  | 'extract-tarball'
+  | 'cache-package'
+  | 'generate-index';
+
+class FhirPackageInstallError extends Error {
+  public readonly packageId: string;
+  public readonly version: string;
+  public readonly registryUrl: string;
+  public readonly cachePath: string;
+  public readonly step: FhirPackageInstallStep;
+  public readonly tarballUrl?: string;
+
+  constructor(args: {
+    packageId: string;
+    version: string;
+    registryUrl: string;
+    cachePath: string;
+    step: FhirPackageInstallStep;
+    tarballUrl?: string;
+    cause?: unknown;
+  }) {
+    const safe = (v: unknown): string => {
+      if (v == null) return '';
+      if (typeof v === 'string') return v;
+      if (v instanceof Error) return v.message;
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
+
+    const pkg = `${args.packageId}@${args.version}`;
+    const meta = `step=${args.step} registryUrl=${args.registryUrl} cachePath=${args.cachePath}`;
+    const tarball = args.tarballUrl ? ` tarballUrl=${args.tarballUrl}` : '';
+    const causeText = args.cause ? ` Cause: ${safe(args.cause)}` : '';
+    super(`Failed to install ${pkg}. ${meta}.${tarball}${causeText}`, { cause: args.cause });
+    this.name = 'FhirPackageInstallError';
+    this.packageId = args.packageId;
+    this.version = args.version;
+    this.registryUrl = args.registryUrl;
+    this.cachePath = args.cachePath;
+    this.step = args.step;
+    this.tarballUrl = args.tarballUrl;
+  }
+}
 
 const withSingleFlight = async <T>(
   map: Map<string, Promise<T>>,
@@ -1050,7 +1193,21 @@ export class FhirPackageInstaller {
         this.logger.debug?.(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
 
         const tmp = `${tgzPath}.${process.pid}.${Date.now()}.tmp`;
-        await this.downloadFile(tarballUrl, tmp);
+        try {
+          await this.downloadFile(tarballUrl, tmp);
+        } catch (e: any) {
+          await fs.remove(tmp).catch(() => undefined);
+          if (e instanceof FhirPackageInstallError) throw e;
+          throw new FhirPackageInstallError({
+            packageId: packageObject.id,
+            version: packageObject.version ?? 'unknown',
+            registryUrl: this.registryUrl,
+            cachePath: this.cachePath,
+            step: 'download-tarball',
+            tarballUrl,
+            cause: e,
+          });
+        }
 
         try {
           await fs.move(tmp, tgzPath, { overwrite: false });
@@ -1305,7 +1462,26 @@ export class FhirPackageInstaller {
 
   private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const cachedTgzPath = await this.getOrDownloadDiskCachedTarball(packageObject);
-    return await this.extractTarball(cachedTgzPath, { packageObject });
+    try {
+      return await this.extractTarball(cachedTgzPath, { packageObject });
+    } catch (e: any) {
+      if (e instanceof FhirPackageInstallError) throw e;
+      let tarballUrl: string | undefined;
+      try {
+        tarballUrl = await this.getTarballUrl(packageObject);
+      } catch {
+        tarballUrl = undefined;
+      }
+      throw new FhirPackageInstallError({
+        packageId: packageObject.id,
+        version: packageObject.version ?? 'unknown',
+        registryUrl: this.registryUrl,
+        cachePath: this.cachePath,
+        step: 'extract-tarball',
+        tarballUrl,
+        cause: e,
+      });
+    }
   }
 
   /**
@@ -1329,9 +1505,21 @@ export class FhirPackageInstaller {
         await action(src, finalPath, { overwrite: false });
         this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
       }
-      catch {
-        this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
-        return finalPath;
+      catch (e: any) {
+        // Another process may have installed the package concurrently.
+        if (e?.code === 'EEXIST') {
+          this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
+          return finalPath;
+        }
+        if (e instanceof FhirPackageInstallError) throw e;
+        throw new FhirPackageInstallError({
+          packageId: packageObject.id,
+          version: packageObject.version ?? 'unknown',
+          registryUrl: this.registryUrl,
+          cachePath: this.cachePath,
+          step: 'cache-package',
+          cause: e,
+        });
       }
     }
     return finalPath;
@@ -1468,6 +1656,10 @@ export class FhirPackageInstaller {
     return { id: packageName, version: packageVersion };
   }
 
+  private getImplicitEffectiveCacheKey(packageId: string): string {
+    return `implicit-effective|${this.registryUrl}|${this.cachePath}|${packageId}`;
+  }
+
   private async readManifestFile(packageFolder: string): Promise<PackageManifest> {
     const manifestPath = path.join(packageFolder, 'package.json');
     return await fs.readJSON(manifestPath, { encoding: 'utf8' });
@@ -1477,13 +1669,28 @@ export class FhirPackageInstaller {
     const packageObj = typeof packageId === 'string' 
       ? await this.toPackageObject(packageId)
       : packageId;
-    const manifestFile = await this.readManifestFile(path.join(await this.getPackageDirPath(packageObj), 'package'));
-    if (manifestFile) {
-      return manifestFile;
-    }
 
-    this.logger.warn(`Could not find package manifest for ${packageObj.id}${packageObj.version ? '@' + packageObj.version : ''}`);
-    return { name: packageObj.id, version: packageObj.version || 'unknown' };
+    const packageDir = await this.getPackageDirPath(packageObj);
+    const packageFolder = path.join(packageDir, 'package');
+    try {
+      return await this.readManifestFile(packageFolder);
+    } catch (err: any) {
+      const code = err?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        if (IMPLICIT_PACKAGE_IDS.has(packageObj.id)) {
+          const cacheKey = this.getImplicitEffectiveCacheKey(packageObj.id);
+          const implicitFailure = implicitResolutionFailureCache.get(cacheKey);
+          if (implicitFailure) throw implicitFailure;
+        }
+
+        const expected = path.join(packageFolder, 'package.json');
+        throw new Error(
+          `Could not find package manifest for ${packageObj.id}@${packageObj.version} in cachePath=${this.cachePath} ` +
+          `(expected ${expected}).`
+        );
+      }
+      throw err;
+    }
   }
 
   /**
@@ -1529,48 +1736,141 @@ export class FhirPackageInstaller {
     }
   }
 
-
   /**
-   * Resolve the latest version for an implicit package dependency
-   * Tries online registry first, then falls back to latest cached version
-   * @param packageName The implicit package name
-   * @returns Resolved version or throws if no version found
+   * Resolve an implicit package dependency to an effective version that is installed and manifest-valid.
+   *
+   * Candidate selection (online):
+   *  1) dist-tags.latest
+   *  2) next 2 most recent registry versions (semver desc)
+   *
+   * If the registry is disabled/unavailable, fall back to the latest installed, manifest-valid version.
    */
-  private async resolveLatestImplicitPackageVersion(packageName: string): Promise<string> {
-    // Implicit packages are always "latest". If registry is disabled/offline, fall back to latest installed.
-    if (this.isRegistryDisabled()) {
-      this.logger.warn(
-        `Registry disabled; using latest installed version for implicit package ${packageName} (if available)`
-      );
-      const installedVersions = await this.getInstalledVersions(packageName);
-      if (installedVersions.length === 0) {
-        throw new Error(
-          `No version of implicit package ${packageName} found in cache (${this.cachePath}). Cannot start without a registry.`
-        );
-      }
-      const latestCached = installedVersions[0];
-      return latestCached;
+  private async resolveImplicitPackageVersionWithFallbacks(packageName: string): Promise<string> {
+    const cacheKey = this.getImplicitEffectiveCacheKey(packageName);
+    const cachedFailure = implicitResolutionFailureCache.get(cacheKey);
+    if (cachedFailure) throw cachedFailure;
+    const cached = implicitEffectiveVersionCache.get(cacheKey);
+    if (cached) {
+      const ok = await this.packageManifestExists({ id: packageName, version: cached });
+      if (ok) return cached;
+      implicitEffectiveVersionCache.delete(cacheKey);
     }
 
-    // Online-first (with shared disk cache), fallback to installed versions if registry is unavailable.
-    try {
-      return await this.checkLatestPackageDist(packageName);
-    } catch (onlineError: any) {
-      this.logger.warn(
-        `Failed to fetch latest version for implicit package ${packageName} from registry: ${onlineError?.message || onlineError}`
-      );
-
-      const installedVersions = await this.getInstalledVersions(packageName);
-      if (installedVersions.length === 0) {
-        throw new Error(
-          `No version of implicit package ${packageName} found in cache (${this.cachePath}). Cannot determine version to use.`
-        );
+    return await withSingleFlight(inFlightImplicitEffectiveVersion, cacheKey, async () => {
+      const cachedFailure2 = implicitResolutionFailureCache.get(cacheKey);
+      if (cachedFailure2) throw cachedFailure2;
+      const cached2 = implicitEffectiveVersionCache.get(cacheKey);
+      if (cached2) {
+        const ok = await this.packageManifestExists({ id: packageName, version: cached2 });
+        if (ok) return cached2;
+        implicitEffectiveVersionCache.delete(cacheKey);
       }
 
-      const latestCached = installedVersions[0];
-      this.logger.warn(`Using cached version for implicit package ${packageName}: ${latestCached}`);
-      return latestCached;
-    }
+      try {
+        const resolveFromInstalled = async (detail: string): Promise<string> => {
+          this.logger.warn?.(detail);
+          const installedVersions = await this.getInstalledVersions(packageName);
+          const attempted: string[] = [];
+          const causes: string[] = [];
+          for (const v of installedVersions) {
+            attempted.push(v);
+            try {
+              const ok = await this.isInstalled({ id: packageName, version: v }, { deep: false });
+              if (ok) {
+                implicitResolutionFailureCache.delete(cacheKey);
+                implicitEffectiveVersionCache.set(cacheKey, v, this.registryTtlMs);
+                return v;
+              }
+            } catch (e: any) {
+              causes.push(`${v}: ${e?.message || String(e)}`);
+            }
+          }
+          throw new ImplicitPackageResolutionError({
+            packageId: packageName,
+            attemptedVersions: attempted,
+            registryUrl: this.registryUrl,
+            cachePath: this.cachePath,
+            causes
+          });
+        };
+
+        // Registry disabled mode: never attempt downloads.
+        if (this.isRegistryDisabled()) {
+          return await resolveFromInstalled(
+            `Registry disabled; using latest installed version for implicit package ${packageName} (if available)`
+          );
+        }
+
+        // Online-first candidate gathering (using the existing cached registry metadata).
+        let candidates: string[] = [];
+        try {
+          const packageData = await this.getPackageDataFromRegistry(packageName);
+          const latest = packageData['dist-tags']?.latest as string | undefined;
+          const versionsObj = (packageData.versions || {}) as Record<string, any>;
+          const allVersions = Object.keys(versionsObj)
+            .filter((v) => typeof v === 'string' && semver.valid(v))
+            .sort((a, b) => semver.rcompare(a, b));
+
+          const unique: string[] = [];
+          const pushUnique = (v: string | undefined) => {
+            if (!v || typeof v !== 'string') return;
+            if (!unique.includes(v)) unique.push(v);
+          };
+
+          pushUnique(latest);
+          for (const v of allVersions) {
+            pushUnique(v);
+            if (unique.length >= 3) break;
+          }
+          candidates = unique;
+        } catch (e: any) {
+          // Registry unavailable: use latest installed that is manifest-valid.
+          return await resolveFromInstalled(
+            `Failed to fetch registry metadata for implicit package ${packageName}: ${e?.message || String(e)}. ` +
+            'Falling back to latest installed version (if available).'
+          );
+        }
+
+        const attemptedVersions: string[] = [];
+        const causes: string[] = [];
+        for (const version of candidates) {
+          attemptedVersions.push(version);
+          const pkgObj = { id: packageName, version };
+          try {
+            const alreadyOk = await this.isInstalled(pkgObj, { deep: false });
+            if (alreadyOk) {
+              implicitResolutionFailureCache.delete(cacheKey);
+              implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+              return version;
+            }
+
+            await this.install(pkgObj);
+            const okAfterInstall = await this.isInstalled(pkgObj, { deep: false });
+            if (okAfterInstall) {
+              implicitResolutionFailureCache.delete(cacheKey);
+              implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+              return version;
+            }
+            causes.push(`${version}: install completed but manifest missing`);
+          } catch (e: any) {
+            causes.push(`${version}: ${e?.message || String(e)}`);
+          }
+        }
+
+        throw new ImplicitPackageResolutionError({
+          packageId: packageName,
+          attemptedVersions,
+          registryUrl: this.registryUrl,
+          cachePath: this.cachePath,
+          causes
+        });
+      } catch (e: any) {
+        if (e instanceof ImplicitPackageResolutionError) {
+          implicitResolutionFailureCache.set(cacheKey, e, this.registryTtlMs);
+        }
+        throw e;
+      }
+    });
   }
 
   /**
@@ -1600,7 +1900,7 @@ export class FhirPackageInstaller {
       // Resolve versions for each implicit dependency.
       // If any implicit package can't be resolved (and isn't installed), we must fail startup.
       for (const implicitPackageId of implicitPackageIds) {
-        const version = await this.resolveLatestImplicitPackageVersion(implicitPackageId);
+        const version = await this.resolveImplicitPackageVersionWithFallbacks(implicitPackageId);
         implicitDeps[implicitPackageId] = version;
       }
     } finally {
@@ -1703,7 +2003,19 @@ export class FhirPackageInstaller {
   }
 
   private async installPackageDependencies(packageObject: FhirPackageIdentifier): Promise<void>{
-    await this.getPackageIndexFile(packageObject);
+    try {
+      await this.getPackageIndexFile(packageObject);
+    } catch (e: any) {
+      if (e instanceof FhirPackageInstallError) throw e;
+      throw new FhirPackageInstallError({
+        packageId: packageObject.id,
+        version: packageObject.version ?? 'unknown',
+        registryUrl: this.registryUrl,
+        cachePath: this.cachePath,
+        step: 'generate-index',
+        cause: e,
+      });
+    }
     
     // Get all dependencies (explicit + implicit) using the updated getDependencies method
     const allDeps = await this.getDependencies(packageObject);
