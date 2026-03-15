@@ -136,6 +136,56 @@ class ImplicitPackageResolutionError extends Error {
   }
 }
 
+type FhirPackageInstallStep =
+  | 'download-tarball'
+  | 'extract-tarball'
+  | 'cache-package'
+  | 'generate-index';
+
+class FhirPackageInstallError extends Error {
+  public readonly packageId: string;
+  public readonly version: string;
+  public readonly registryUrl: string;
+  public readonly cachePath: string;
+  public readonly step: FhirPackageInstallStep;
+  public readonly tarballUrl?: string;
+
+  constructor(args: {
+    packageId: string;
+    version: string;
+    registryUrl: string;
+    cachePath: string;
+    step: FhirPackageInstallStep;
+    tarballUrl?: string;
+    cause?: unknown;
+  }) {
+    const safe = (v: unknown): string => {
+      if (v == null) return '';
+      if (typeof v === 'string') return v;
+      if (v instanceof Error) return v.message;
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
+
+    const pkg = `${args.packageId}@${args.version}`;
+    const meta = `step=${args.step} registryUrl=${args.registryUrl} cachePath=${args.cachePath}`;
+    const tarball = args.tarballUrl ? ` tarballUrl=${args.tarballUrl}` : '';
+    const causeText = args.cause ? ` Cause: ${safe(args.cause)}` : '';
+    super(`Failed to install ${pkg}. ${meta}.${tarball}${causeText}`);
+    this.name = 'FhirPackageInstallError';
+    this.packageId = args.packageId;
+    this.version = args.version;
+    this.registryUrl = args.registryUrl;
+    this.cachePath = args.cachePath;
+    this.step = args.step;
+    this.tarballUrl = args.tarballUrl;
+    (this as any).cause = args.cause;
+  }
+}
+
 const withSingleFlight = async <T>(
   map: Map<string, Promise<T>>,
   key: string,
@@ -1085,7 +1135,20 @@ export class FhirPackageInstaller {
         this.logger.debug?.(`Downloading ${packageObject.id}@${packageObject.version} from ${tarballUrl}`);
 
         const tmp = `${tgzPath}.${process.pid}.${Date.now()}.tmp`;
-        await this.downloadFile(tarballUrl, tmp);
+        try {
+          await this.downloadFile(tarballUrl, tmp);
+        } catch (e: any) {
+          if (e instanceof FhirPackageInstallError) throw e;
+          throw new FhirPackageInstallError({
+            packageId: packageObject.id,
+            version: packageObject.version ?? 'unknown',
+            registryUrl: this.registryUrl,
+            cachePath: this.cachePath,
+            step: 'download-tarball',
+            tarballUrl,
+            cause: e,
+          });
+        }
 
         try {
           await fs.move(tmp, tgzPath, { overwrite: false });
@@ -1340,7 +1403,26 @@ export class FhirPackageInstaller {
 
   private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
     const cachedTgzPath = await this.getOrDownloadDiskCachedTarball(packageObject);
-    return await this.extractTarball(cachedTgzPath, { packageObject });
+    try {
+      return await this.extractTarball(cachedTgzPath, { packageObject });
+    } catch (e: any) {
+      if (e instanceof FhirPackageInstallError) throw e;
+      let tarballUrl: string | undefined;
+      try {
+        tarballUrl = await this.getTarballUrl(packageObject);
+      } catch {
+        tarballUrl = undefined;
+      }
+      throw new FhirPackageInstallError({
+        packageId: packageObject.id,
+        version: packageObject.version ?? 'unknown',
+        registryUrl: this.registryUrl,
+        cachePath: this.cachePath,
+        step: 'extract-tarball',
+        tarballUrl,
+        cause: e,
+      });
+    }
   }
 
   /**
@@ -1364,9 +1446,21 @@ export class FhirPackageInstaller {
         await action(src, finalPath, { overwrite: false });
         this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
       }
-      catch {
-        this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
-        return finalPath;
+      catch (e: any) {
+        // Another process may have installed the package concurrently.
+        if (e?.code === 'EEXIST') {
+          this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
+          return finalPath;
+        }
+        if (e instanceof FhirPackageInstallError) throw e;
+        throw new FhirPackageInstallError({
+          packageId: packageObject.id,
+          version: packageObject.version ?? 'unknown',
+          registryUrl: this.registryUrl,
+          cachePath: this.cachePath,
+          step: 'cache-package',
+          cause: e,
+        });
       }
     }
     return finalPath;
@@ -1809,7 +1903,19 @@ export class FhirPackageInstaller {
   }
 
   private async installPackageDependencies(packageObject: FhirPackageIdentifier): Promise<void>{
-    await this.getPackageIndexFile(packageObject);
+    try {
+      await this.getPackageIndexFile(packageObject);
+    } catch (e: any) {
+      if (e instanceof FhirPackageInstallError) throw e;
+      throw new FhirPackageInstallError({
+        packageId: packageObject.id,
+        version: packageObject.version ?? 'unknown',
+        registryUrl: this.registryUrl,
+        cachePath: this.cachePath,
+        step: 'generate-index',
+        cause: e,
+      });
+    }
     
     // Get all dependencies (explicit + implicit) using the updated getDependencies method
     const allDeps = await this.getDependencies(packageObject);
