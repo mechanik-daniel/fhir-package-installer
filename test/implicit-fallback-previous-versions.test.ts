@@ -119,7 +119,7 @@ describe('Implicit package previous-versions fallback (regression)', () => {
     async () => {
       const r4CorePackage = { id: 'hl7.fhir.r4.core', version: '4.0.1' };
 
-      // Desired behavior (will fail until Phase 1 is implemented):
+      // Expected behavior:
       // - install succeeds by falling back from 7.1.0 -> 7.0.0
       // - dependency closure reports the effective implicit version (7.0.0)
       await fpi.install(r4CorePackage);
