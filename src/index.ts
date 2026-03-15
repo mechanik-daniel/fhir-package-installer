@@ -1703,13 +1703,21 @@ export class FhirPackageInstaller {
     const cachedFailure = implicitResolutionFailureCache.get(cacheKey);
     if (cachedFailure) throw cachedFailure;
     const cached = implicitEffectiveVersionCache.get(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      const ok = await this.packageManifestExists({ id: packageName, version: cached });
+      if (ok) return cached;
+      implicitEffectiveVersionCache.delete(cacheKey);
+    }
 
     return await withSingleFlight(inFlightImplicitEffectiveVersion, cacheKey, async () => {
       const cachedFailure2 = implicitResolutionFailureCache.get(cacheKey);
       if (cachedFailure2) throw cachedFailure2;
       const cached2 = implicitEffectiveVersionCache.get(cacheKey);
-      if (cached2) return cached2;
+      if (cached2) {
+        const ok = await this.packageManifestExists({ id: packageName, version: cached2 });
+        if (ok) return cached2;
+        implicitEffectiveVersionCache.delete(cacheKey);
+      }
 
       try {
         const resolveFromInstalled = async (detail: string): Promise<string> => {

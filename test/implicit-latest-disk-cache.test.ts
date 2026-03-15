@@ -38,17 +38,13 @@ describe('Implicit latest version disk cache', () => {
       logger: noopLogger,
     });
 
-    const fpi1Implicit = fpi1 as unknown as {
-      resolveLatestImplicitPackageVersion: (packageName: string) => Promise<string>;
-    };
-
     const fpi1Internal = fpi1 as unknown as { fetchJson: (...args: unknown[]) => Promise<unknown> };
     const mockFetchJson1 = vi.fn().mockResolvedValue({
       'dist-tags': { latest: '1.2.3' },
     });
     fpi1Internal.fetchJson = mockFetchJson1;
 
-    const v1 = await fpi1Implicit.resolveLatestImplicitPackageVersion(implicitPackageName);
+    const v1 = await fpi1.checkLatestPackageDist(implicitPackageName);
     expect(v1).toBe('1.2.3');
     expect(mockFetchJson1).toHaveBeenCalledTimes(1);
 
@@ -65,15 +61,11 @@ describe('Implicit latest version disk cache', () => {
       logger: noopLogger,
     });
 
-    const fpi2Implicit = fpi2 as unknown as {
-      resolveLatestImplicitPackageVersion: (packageName: string) => Promise<string>;
-    };
-
     const fpi2Internal = fpi2 as unknown as { fetchJson: (...args: unknown[]) => Promise<unknown> };
     const mockFetchJson2 = vi.fn().mockRejectedValue(new Error('Registry should not be called'));
     fpi2Internal.fetchJson = mockFetchJson2;
 
-    const v2 = await fpi2Implicit.resolveLatestImplicitPackageVersion(implicitPackageName);
+    const v2 = await fpi2.checkLatestPackageDist(implicitPackageName);
     expect(v2).toBe('1.2.3');
     expect(mockFetchJson2).toHaveBeenCalledTimes(0);
   });
@@ -92,17 +84,13 @@ describe('Implicit latest version disk cache', () => {
       logger: noopLogger,
     });
 
-    const fpiImplicit = fpi as unknown as {
-      resolveLatestImplicitPackageVersion: (packageName: string) => Promise<string>;
-    };
-
     const fpiInternal = fpi as unknown as { fetchJson: (...args: unknown[]) => Promise<unknown> };
     const mockFetchJson = vi.fn().mockResolvedValue({
       'dist-tags': { latest: '2.3.4' },
     });
     fpiInternal.fetchJson = mockFetchJson;
 
-    const v = await fpiImplicit.resolveLatestImplicitPackageVersion(implicitPackageName);
+    const v = await fpi.checkLatestPackageDist(implicitPackageName);
     expect(v).toBe('2.3.4');
     expect(mockFetchJson).toHaveBeenCalledTimes(1);
 
