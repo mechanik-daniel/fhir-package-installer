@@ -61,7 +61,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "fs-extra": "^11.3.3",
+    "fs-extra": "^11.3.4",
     "p-limit": "^7.3.0",
     "semver": "^7.7.4",
     "tar-stream": "^3.1.7"
