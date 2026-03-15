@@ -6,7 +6,8 @@ import * as zlib from 'zlib';
 export type LocalRegistryPackageVersion = {
   tgz: Buffer;
   tarballStatus?: number;
-  tarballBody?: Buffer;
+  tarballData?: Buffer;
+  tarballErrorBody?: Buffer;
 };
 
 export type LocalRegistryPackage = {
@@ -113,7 +114,7 @@ export function createLocalRegistryServer(
 
             if (status !== 200) {
               const body =
-                version.tarballBody ?? Buffer.from(JSON.stringify({ error: 'Tarball failed (forced)' }), 'utf8');
+                version.tarballErrorBody ?? Buffer.from(JSON.stringify({ error: 'Tarball failed (forced)' }), 'utf8');
               res.writeHead(status, {
                 'Content-Type': 'application/json',
                 'Content-Length': String(body.length),
@@ -122,7 +123,7 @@ export function createLocalRegistryServer(
               return;
             }
 
-            const tgz = version.tarballBody ?? version.tgz;
+            const tgz = version.tarballData ?? version.tgz;
             res.writeHead(200, {
               'Content-Type': 'application/octet-stream',
               'Content-Length': String(tgz.length),
