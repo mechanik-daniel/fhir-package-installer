@@ -68,7 +68,7 @@ const FPI_INDEX_CACHE_VERSION = (() => {
   if (!v) return '0.0';
   return `${v.major}.${v.minor}`;
 })();
-const FPI_INSTALL_DIAGNOSTICS_ENV = 'FPI_INSTALL_DIAGNOSTICS';
+const FPI_STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
@@ -619,114 +619,311 @@ export class FhirPackageInstaller {
     return dir;
   }
 
-  private isInstallDiagnosticsEnabled(): boolean {
-    const raw = process.env[FPI_INSTALL_DIAGNOSTICS_ENV]?.trim().toLowerCase();
-    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  private getPackageInstallLockKey(packageObject: FhirPackageIdentifier): string {
+    return `package-install|${packageObject.id}#${packageObject.version}`;
   }
 
-  private async getInstallDiagnosticsPath(): Promise<string> {
-    const dir = await this.ensureDiskCacheSubdir('diagnostics');
-    return path.join(dir, `install-trace-${process.pid}.ndjson`);
+  private async withPackageInstallLock<T>(
+    packageObject: FhirPackageIdentifier,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    const lockKey = this.getPackageInstallLockKey(packageObject);
+    return await this.withDiskLock(lockKey, async () => {
+      return await fn();
+    });
   }
 
-  private async snapshotPackageMaterialization(packageObject: FhirPackageIdentifier): Promise<Record<string, unknown>> {
-    const packageRoot = await this.getPackageDirPath(packageObject);
-    const packageDir = path.join(packageRoot, 'package');
-    const manifestPath = path.join(packageDir, 'package.json');
-    const indexPath = path.join(packageDir, '.fpi.index.json');
-    const locksDir = path.join(this.cachePath, '.fpi.cache', 'locks');
+  private async getStagingPath(): Promise<string> {
+    return await this.ensureDiskCacheSubdir('staging');
+  }
 
-    const [packageRootExists, packageDirExists, manifestExists, indexExists, locksDirExists] = await Promise.all([
-      fs.exists(packageRoot),
-      fs.exists(packageDir),
-      fs.exists(manifestPath),
-      fs.exists(indexPath),
-      fs.exists(locksDir),
-    ]);
-
-    let packageEntryCount: number | null = null;
+  private async cleanupStaleStagingDirectories(maxAgeMs: number = FPI_STAGING_MAX_AGE_MS): Promise<void> {
     try {
-      packageEntryCount = (await fs.readdir(packageDir)).length;
-    } catch {
-      packageEntryCount = null;
-    }
-
-    let lockEntryCount: number | null = null;
-    try {
-      lockEntryCount = locksDirExists ? (await fs.readdir(locksDir)).length : 0;
-    } catch {
-      lockEntryCount = null;
-    }
-
-    let indexEntryCount: number | null = null;
-    let missingIndexedFilesCount: number | null = null;
-    let missingIndexedFilesSample: string[] = [];
-    let indexReadError: string | null = null;
-
-    if (indexExists) {
-      try {
-        const indexJson = await fs.readJSON(indexPath, { encoding: 'utf8' }) as Partial<PackageIndex>;
-        const files = Array.isArray(indexJson?.files) ? indexJson.files : [];
-        const missing: string[] = [];
-        for (const file of files) {
-          const filename = typeof file?.filename === 'string' ? file.filename : null;
-          if (!filename) {
-            continue;
+      const stagingPath = await this.getStagingPath();
+      const entries = await fs.readdir(stagingPath);
+      const now = Date.now();
+      for (const entry of entries) {
+        const entryPath = path.join(stagingPath, entry);
+        try {
+          const stats = await fs.stat(entryPath);
+          if (now - stats.mtimeMs > maxAgeMs) {
+            await fs.remove(entryPath);
           }
-          if (!await fs.exists(path.join(packageDir, filename))) {
-            missing.push(filename);
-          }
+        } catch {
+          // best-effort cleanup
         }
-        indexEntryCount = files.length;
-        missingIndexedFilesCount = missing.length;
-        missingIndexedFilesSample = missing.slice(0, 10);
-      } catch (error) {
-        indexReadError = error instanceof Error ? error.message : String(error);
       }
+    } catch {
+      // best-effort cleanup
     }
+  }
+
+  private async createStagingDirectory(packageObject: FhirPackageIdentifier): Promise<string> {
+    await this.cleanupStaleStagingDirectories();
+    const stagingPath = await this.getStagingPath();
+    const dirName = `${await this.toDirName(packageObject)}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+    const fullPath = path.join(stagingPath, dirName);
+    await fs.ensureDir(fullPath);
+    return fullPath;
+  }
+
+  private async buildPackageIndexFromPackageDir(packageDir: string): Promise<PackageIndex> {
+    const fileList = await fs.readdir(packageDir);
+    const files = await Promise.all(
+      fileList.filter(
+        file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
+      ).map(
+        file => limit(
+          async () => {
+            const contentText = await fs.readFile(path.join(packageDir, file), { encoding: 'utf8' });
+            const content = JSON.parse(contentText) as PackageResource;
+            return extractResourceIndexEntry(file, content);
+          }
+        )
+      )
+    );
 
     return {
-      packageRoot,
-      packageDir,
-      packageRootExists,
-      packageDirExists,
-      manifestExists,
-      indexExists,
-      packageEntryCount,
-      indexEntryCount,
-      missingIndexedFilesCount,
-      missingIndexedFilesSample,
-      indexReadError,
-      lockEntryCount,
+      'index-version': 2,
+      files,
     };
   }
 
-  private async writeInstallDiagnostic(
-    event: string,
+  private normalizeIndexEntry(entry: Record<string, unknown>): FileInPackageIndex | null {
+    const filename = typeof entry.filename === 'string' ? entry.filename : null;
+    const resourceType = typeof entry.resourceType === 'string' ? entry.resourceType : null;
+    const id = typeof entry.id === 'string' ? entry.id : null;
+    if (!filename) {
+      return null;
+    }
+    if (!resourceType || !id) {
+      return null;
+    }
+
+    const readOptionalString = (key: keyof FileInPackageIndex): string | undefined => {
+      const value = entry[key as string];
+      return typeof value === 'string' ? value : undefined;
+    };
+
+    return {
+      filename,
+      resourceType,
+      id,
+      url: readOptionalString('url'),
+      name: readOptionalString('name'),
+      version: readOptionalString('version'),
+      kind: readOptionalString('kind'),
+      type: readOptionalString('type'),
+      supplements: readOptionalString('supplements'),
+      content: readOptionalString('content'),
+      baseDefinition: readOptionalString('baseDefinition'),
+      derivation: readOptionalString('derivation'),
+      date: readOptionalString('date'),
+    };
+  }
+
+  private normalizePackageIndex(raw: unknown): PackageIndex | null {
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+
+    const candidate = raw as { files?: unknown };
+    if (!Array.isArray(candidate.files)) {
+      return null;
+    }
+
+    const files: FileInPackageIndex[] = [];
+    for (const file of candidate.files) {
+      if (!file || typeof file !== 'object') {
+        return null;
+      }
+      const normalized = this.normalizeIndexEntry(file as Record<string, unknown>);
+      if (!normalized) {
+        return null;
+      }
+      files.push(normalized);
+    }
+
+    return {
+      'index-version': 2,
+      files,
+    };
+  }
+
+  private async persistMaterializedPackageIndex(
     packageObject: FhirPackageIdentifier,
-    extra: Record<string, unknown> = {}
-  ): Promise<void> {
-    if (!this.isInstallDiagnosticsEnabled()) {
-      return;
+    packageDir: string,
+    indexJson: PackageIndex
+  ): Promise<PackageIndex> {
+    const indexPath = path.join(packageDir, '.fpi.index.json');
+    await fs.writeJSON(indexPath, indexJson);
+
+    const memKey = this.getIndexMemKey(packageObject);
+    memSetNoTtl(memKey, indexJson);
+    try {
+      const diskPath = this.getDiskIndexCachePath(packageObject);
+      await this.ensureDiskCacheSubdir('indexes');
+      await this.writeDiskCacheJsonNoTtl(diskPath, indexJson);
+    } catch {
+      // ignore
+    }
+
+    return indexJson;
+  }
+
+  private async tryMaterializeLegacyPackageIndex(
+    packageObject: FhirPackageIdentifier,
+    packageDir: string
+  ): Promise<PackageIndex | null> {
+    const legacyIndexPath = path.join(packageDir, '.index.json');
+    if (!await fs.exists(legacyIndexPath)) {
+      return null;
+    }
+
+    return await this.withDiskLock(this.getIndexDiskLockKey(packageObject), async () => {
+      const fpiIndexPath = path.join(packageDir, '.fpi.index.json');
+      if (await fs.exists(fpiIndexPath)) {
+        const current = await fs.readJSON(fpiIndexPath, { encoding: 'utf8' }) as unknown;
+        return this.normalizePackageIndex(current);
+      }
+
+      const legacyRaw = await fs.readJSON(legacyIndexPath, { encoding: 'utf8' }) as unknown;
+      const legacyIndex = this.normalizePackageIndex(legacyRaw);
+      if (!legacyIndex) {
+        return null;
+      }
+
+      for (const file of legacyIndex.files) {
+        if (!await fs.exists(path.join(packageDir, file.filename))) {
+          return null;
+        }
+      }
+
+      return await this.persistMaterializedPackageIndex(packageObject, packageDir, legacyIndex);
+    });
+  }
+
+  private async materializePackageIndex(
+    packageObject: FhirPackageIdentifier,
+    packageDir: string
+  ): Promise<PackageIndex> {
+    const memKey = this.getIndexMemKey(packageObject);
+    const memHit = memGet<PackageIndex>(memKey);
+    if (memHit) {
+      return await this.persistMaterializedPackageIndex(packageObject, packageDir, memHit);
+    }
+
+    return await this.withDiskLock(this.getIndexDiskLockKey(packageObject), async () => {
+      const memHit2 = memGet<PackageIndex>(memKey);
+      if (memHit2) {
+        return await this.persistMaterializedPackageIndex(packageObject, packageDir, memHit2);
+      }
+
+      const diskPath = this.getDiskIndexCachePath(packageObject);
+      const diskHit = await withSingleFlight(inFlightIndex, `disk-${memKey}`, async () => {
+        await this.ensureDiskCacheSubdir('indexes');
+        return await this.readDiskCacheJson<PackageIndex>(diskPath);
+      });
+      if (diskHit) {
+        return await this.persistMaterializedPackageIndex(packageObject, packageDir, diskHit);
+      }
+
+      const indexJson = await this.buildPackageIndexFromPackageDir(packageDir);
+      return await this.persistMaterializedPackageIndex(packageObject, packageDir, indexJson);
+    });
+  }
+
+  private async getPackageMaterializationStatus(packageObject: FhirPackageIdentifier): Promise<{
+    complete: boolean;
+    reason:
+      | 'package-root-missing'
+      | 'package-dir-missing'
+      | 'manifest-missing'
+      | 'manifest-invalid'
+      | 'index-missing'
+      | 'index-invalid'
+      | 'indexed-files-missing';
+    missingFiles: string[];
+  }> {
+    const packageRoot = await this.getPackageDirPath(packageObject);
+    if (!await fs.exists(packageRoot)) {
+      return { complete: false, reason: 'package-root-missing', missingFiles: [] };
+    }
+
+    const packageDir = path.join(packageRoot, 'package');
+    if (!await fs.exists(packageDir)) {
+      return { complete: false, reason: 'package-dir-missing', missingFiles: [] };
+    }
+
+    const manifestPath = path.join(packageDir, 'package.json');
+    if (!await fs.exists(manifestPath)) {
+      return { complete: false, reason: 'manifest-missing', missingFiles: [] };
     }
 
     try {
-      const filePath = await this.getInstallDiagnosticsPath();
-      const payload = {
-        timestamp: new Date().toISOString(),
-        pid: process.pid,
-        event,
-        packageId: packageObject.id,
-        version: packageObject.version,
-        cachePath: this.cachePath,
-        state: await this.snapshotPackageMaterialization(packageObject),
-        ...extra,
-      };
-      await fs.appendFile(filePath, `${JSON.stringify(payload)}\n`, 'utf8');
+      await fs.readJSON(manifestPath, { encoding: 'utf8' });
+    } catch {
+      return { complete: false, reason: 'manifest-invalid', missingFiles: [] };
+    }
+
+    const indexPath = path.join(packageDir, '.fpi.index.json');
+    if (!await fs.exists(indexPath)) {
+      const legacyMaterializedIndex = await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir);
+      if (!legacyMaterializedIndex) {
+        return { complete: false, reason: 'index-missing', missingFiles: [] };
+      }
+      return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+    }
+
+    let indexJson: Partial<PackageIndex>;
+    try {
+      indexJson = await fs.readJSON(indexPath, { encoding: 'utf8' }) as Partial<PackageIndex>;
+    } catch {
+      return { complete: false, reason: 'index-invalid', missingFiles: [] };
+    }
+
+    if (!Array.isArray(indexJson.files)) {
+      return { complete: false, reason: 'index-invalid', missingFiles: [] };
+    }
+
+    const missingFiles: string[] = [];
+    for (const file of indexJson.files) {
+      const filename = typeof file?.filename === 'string' ? file.filename : null;
+      if (!filename) {
+        return { complete: false, reason: 'index-invalid', missingFiles: [] };
+      }
+      if (!await fs.exists(path.join(packageDir, filename))) {
+        missingFiles.push(filename);
+      }
+    }
+
+    if (missingFiles.length > 0) {
+      return { complete: false, reason: 'indexed-files-missing', missingFiles };
+    }
+
+    return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+  }
+
+  private async stagePackageForPublish(
+    packageObject: FhirPackageIdentifier,
+    src: string,
+    move: boolean
+  ): Promise<string> {
+    const stagingRoot = await this.createStagingDirectory(packageObject);
+    const sourcePackageDir = await fs.exists(path.join(src, 'package')) ? path.join(src, 'package') : src;
+    const stagingPackageDir = path.join(stagingRoot, 'package');
+
+    try {
+      const action = move ? fs.move : fs.copy;
+      await action(sourcePackageDir, stagingPackageDir, { overwrite: false });
+      if (move && sourcePackageDir !== src) {
+        await fs.remove(src).catch(() => undefined);
+      }
+      await this.materializePackageIndex(packageObject, stagingPackageDir);
+      return stagingRoot;
     } catch (error) {
-      this.logger.debug?.(
-        `Failed to write install diagnostics for ${packageObject.id}@${packageObject.version}: ${error instanceof Error ? error.message : String(error)}`
-      );
+      await fs.remove(stagingRoot).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -861,8 +1058,8 @@ export class FhirPackageInstaller {
       if (visited.has(key)) return;
       visited.add(key);
 
-      const hasManifest = await this.packageManifestExists(pkg);
-      if (!hasManifest) {
+      const isMaterialized = await this.isInstalled(pkg, { deep: false });
+      if (!isMaterialized) {
         missing.push(key);
         return;
       }
@@ -948,70 +1145,7 @@ export class FhirPackageInstaller {
     const pckIdObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
     this.logger.debug?.(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
     const packagePath = await this.getPackageDirPath(pckIdObj);
-    const indexPath = await this.getPackageIndexPath(pckIdObj);
-
-    // Layer 1: memory
-    const memKey = this.getIndexMemKey(pckIdObj);
-    const memHit = memGet<PackageIndex>(memKey);
-    if (memHit) {
-      await fs.writeJSON(indexPath, memHit);
-      return memHit;
-    }
-
-    // Cross-process: ensure only one process does the expensive scan per package version.
-    return await this.withDiskLock(this.getIndexDiskLockKey(pckIdObj), async () => {
-      // Re-check memory after acquiring the lock.
-      const memHit2 = memGet<PackageIndex>(memKey);
-      if (memHit2) {
-        await fs.writeJSON(indexPath, memHit2);
-        return memHit2;
-      }
-
-      // Layer 2: per-cachePath disk
-      const diskPath = this.getDiskIndexCachePath(pckIdObj);
-      const diskHit = await withSingleFlight(inFlightIndex, `disk-${memKey}`, async () => {
-        // Ensure parent exists lazily
-        await this.ensureDiskCacheSubdir('indexes');
-        return await this.readDiskCacheJson<PackageIndex>(diskPath);
-      });
-      if (diskHit) {
-        memSetNoTtl(memKey, diskHit);
-        await fs.writeJSON(indexPath, diskHit);
-        return diskHit;
-      }
-
-      const fileList = await fs.readdir(path.join(packagePath, 'package'));
-      const files = await Promise.all(
-        fileList.filter(
-          file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
-        ).map(
-          file => limit(
-            async () => {
-              const contentText = await fs.readFile(path.join(packagePath, 'package', file), { encoding: 'utf8' });
-              const content = JSON.parse(contentText) as PackageResource;
-              const indexEntry = extractResourceIndexEntry(file, content);
-              return indexEntry;
-            }
-          )
-        )
-      );
-      const indexJson: PackageIndex = {
-        'index-version': 2,
-        files
-      };
-      await fs.writeJSON(indexPath, indexJson);
-
-      // Persist to memory + per-cachePath disk (best-effort)
-      memSetNoTtl(memKey, indexJson);
-      try {
-        await this.ensureDiskCacheSubdir('indexes');
-        await this.writeDiskCacheJsonNoTtl(diskPath, indexJson);
-      } catch {
-        // ignore
-      }
-
-      return indexJson;
-    });
+    return await this.materializePackageIndex(pckIdObj, path.join(packagePath, 'package'));
   }
 
   /**
@@ -1605,52 +1739,52 @@ export class FhirPackageInstaller {
    * @returns The path to the cached package directory
    */
   private async cachePackage(packageObject: FhirPackageIdentifier, src: string, move: boolean = true): Promise<string> {
-    let finalPath = await this.getPackageDirPath(packageObject);
-    if (!await fs.exists(path.join(src, 'package'))) {
-      finalPath = path.join(finalPath, 'package');
-    }
-    await this.writeInstallDiagnostic('cache-package-enter', packageObject, { finalPath, move, src });
+    const finalPath = await this.getPackageDirPath(packageObject);
     const isInstalled = await this.isInstalled(packageObject, { deep: false });
-    await this.writeInstallDiagnostic('cache-package-shallow-check', packageObject, {
-      finalPath,
-      isInstalledShallow: isInstalled,
-      move,
-      src,
-    });
-    if (!isInstalled) {
-      // try to move the temp dir to the cache, this will fail if pkg was already installed by a parallel process
-      try {
-        const action = move ? fs.move : fs.copy;
-        await this.writeInstallDiagnostic('cache-package-publish-begin', packageObject, { finalPath, move, src });
-        await action(src, finalPath, { overwrite: false });
-        await this.writeInstallDiagnostic('cache-package-publish-success', packageObject, { finalPath, move, src });
-        this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
-      }
-      catch (e: any) {
-        // Another process may have installed the package concurrently.
-        if (e?.code === 'EEXIST') {
-          await this.writeInstallDiagnostic('cache-package-publish-eexist', packageObject, {
-            errorCode: e?.code ?? null,
-            errorMessage: e?.message ?? String(e),
-            finalPath,
-            move,
-            src,
-          });
-          this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
-          return finalPath;
-        }
-        if (e instanceof FhirPackageInstallError) throw e;
-        throw new FhirPackageInstallError({
-          packageId: packageObject.id,
-          version: packageObject.version ?? 'unknown',
-          registryUrl: this.registryUrl,
-          cachePath: this.cachePath,
-          step: 'cache-package',
-          cause: e,
-        });
-      }
+    if (isInstalled) {
+      return finalPath;
     }
-    return finalPath;
+
+    const stagingPath = await this.stagePackageForPublish(packageObject, src, move);
+
+    try {
+      const existingState = await this.getPackageMaterializationStatus(packageObject);
+      if (!existingState.complete && await fs.exists(finalPath)) {
+        await fs.remove(finalPath);
+      }
+
+      try {
+        await fs.move(stagingPath, finalPath, { overwrite: false });
+      } catch (e: any) {
+        if (e?.code === 'EEXIST') {
+          const stateAfterCollision = await this.getPackageMaterializationStatus(packageObject);
+          if (stateAfterCollision.complete) {
+            this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
+            return finalPath;
+          }
+
+          await fs.remove(finalPath).catch(() => undefined);
+          await fs.move(stagingPath, finalPath, { overwrite: false });
+        } else {
+          throw e;
+        }
+      }
+
+      this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
+      return finalPath;
+    } catch (e: any) {
+      if (e instanceof FhirPackageInstallError) throw e;
+      throw new FhirPackageInstallError({
+        packageId: packageObject.id,
+        version: packageObject.version ?? 'unknown',
+        registryUrl: this.registryUrl,
+        cachePath: this.cachePath,
+        step: 'cache-package',
+        cause: e,
+      });
+    } finally {
+      await fs.remove(stagingPath).catch(() => undefined);
+    }
   }
 
   /**
@@ -1689,15 +1823,11 @@ export class FhirPackageInstaller {
     }
 
     const packageObject = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
-    const dirPath = await this.getPackageDirPath(packageObject);
-    if (!await fs.exists(dirPath)) {
-      return false;
-    }
-    if (!await this.packageManifestExists(packageObject)) {
+    const materialization = await this.getPackageMaterializationStatus(packageObject);
+    if (!materialization.complete) {
       return false;
     }
     if (!deep) {
-      await this.writeInstallDiagnostic('is-installed-shallow-true', packageObject, { deep });
       return true;
     }
 
@@ -2106,36 +2236,33 @@ export class FhirPackageInstaller {
     if (this.installingPackages.has(packageKey)) {
       return true;
     }
-    
-    // Only check that *this package* is present/complete.
-    // Transitive dependency installation is handled by installPackageDependencies().
-    await this.writeInstallDiagnostic('install-start', packageObject);
-    const installedShallow = await this.isInstalled(packageObject, { deep: false });
-    await this.writeInstallDiagnostic('install-after-shallow-check', packageObject, { installedShallow });
-    if (!installedShallow) {
-      const dirPath = await this.getPackageDirPath(packageObject);
-      if (await fs.exists(dirPath)) {
-        // Clean up partial/corrupt installs so we can reinstall cleanly.
-        await this.writeInstallDiagnostic('install-removing-existing-dir', packageObject, { dirPath });
-        await fs.remove(dirPath);
-        await this.writeInstallDiagnostic('install-removed-existing-dir', packageObject, { dirPath });
+
+    const runInstall = async (): Promise<boolean> => {
+      // Only check that *this package* is present/complete.
+      // Transitive dependency installation is handled by installPackageDependencies().
+      const installedShallow = await this.isInstalled(packageObject, { deep: false });
+      if (!installedShallow) {
+        const dirPath = await this.getPackageDirPath(packageObject);
+        if (await fs.exists(dirPath)) {
+          // Clean up partial/corrupt installs so we can reinstall cleanly.
+          await fs.remove(dirPath);
+        }
+        const tempPath = await this.downloadAndExtractTarball(packageObject);
+        await this.cachePackage(packageObject, tempPath);
       }
-      const tempPath = await this.downloadAndExtractTarball(packageObject);
-      await this.writeInstallDiagnostic('install-extracted-tarball', packageObject, { tempPath });
-      await this.cachePackage(packageObject, tempPath);
-      await this.writeInstallDiagnostic('install-after-cache-package', packageObject);
-    }
-    
-    // Mark as installing before dependency installation
-    this.installingPackages.add(packageKey);
-    try {
-      await this.installPackageDependencies(packageObject);
-      await this.writeInstallDiagnostic('install-finished', packageObject);
-      return true;
-    } finally {
-      // Always remove from installing set
-      this.installingPackages.delete(packageKey);
-    }
+
+      // Mark as installing before dependency installation
+      this.installingPackages.add(packageKey);
+      try {
+        await this.installPackageDependencies(packageObject);
+        return true;
+      } finally {
+        // Always remove from installing set
+        this.installingPackages.delete(packageKey);
+      }
+    };
+
+    return await this.withPackageInstallLock(packageObject, runInstall);
   }
 
   private async installPackageDependencies(packageObject: FhirPackageIdentifier): Promise<void>{
@@ -2203,24 +2330,25 @@ export class FhirPackageInstaller {
       const manifest = await this.readManifestFile(manifestFilePath);
       packageObject = { id: manifest.name, version: manifest.version };
     }
-      
-    const alreadyInstalled = await this.isInstalled(packageObject, { deep: false });
-    if (alreadyInstalled && !options?.override) {
-      this.logger.info(`Package ${packageObject.id}@${packageObject.version} is already installed`);
-      return false;
-    } else {
+
+    return await this.withPackageInstallLock(packageObject, async () => {
+      const alreadyInstalled = await this.isInstalled(packageObject, { deep: false });
+      if (alreadyInstalled && !options?.override) {
+        this.logger.info(`Package ${packageObject.id}@${packageObject.version} is already installed`);
+        return false;
+      }
+
       await fs.remove(await this.getPackageDirPath(packageObject));
-    }
 
-    const installedPath = await this.cachePackage(packageObject, finalPath, !isDirectory); // if the source is a file, we can move the temp dir to the cache
-    await this.generatePackageIndex(packageObject);
-    this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${installedPath}`);
-  
-    if (options?.installDependencies) {
-      await this.installPackageDependencies(packageObject);
-    }
+      const installedPath = await this.cachePackage(packageObject, finalPath, !isDirectory); // if the source is a file, we can move the temp dir to the cache
+      this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${installedPath}`);
 
-    return true;
+      if (options?.installDependencies) {
+        await this.installPackageDependencies(packageObject);
+      }
+
+      return true;
+    });
   }
 
   /**
