@@ -2,4 +2,4 @@ dist
 node_modules
 test/.dual-mode*
 test/downloaded-packages
-test/.test-cache*
+test/.*cache*
