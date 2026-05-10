@@ -158,6 +158,49 @@ describe('fhir-package-installer module', () => {
     expect(await customCacheFpi.isInstalled(testPkg)).toBe(true);
   }, TIMEOUT);
 
+  it('should write install diagnostics when enabled', async () => {
+    const previousEnv = process.env.FPI_INSTALL_DIAGNOSTICS;
+    process.env.FPI_INSTALL_DIAGNOSTICS = '1';
+
+    const diagnosticCachePath = createTempDir();
+    const diagnosticFpi = new FhirPackageInstaller({
+      cachePath: diagnosticCachePath,
+      skipExamples: true,
+      allowHttp: true,
+      registryUrl: registry.getBaseUrl(),
+      logger: noopLogger,
+    });
+
+    try {
+      const result = await diagnosticFpi.install(testPkg);
+      expect(result).toBe(true);
+
+      const diagnosticsDir = path.join(diagnosticCachePath, '.fpi.cache', 'diagnostics');
+      const entries = await fs.readdir(diagnosticsDir);
+      expect(entries.length).toBe(1);
+
+      const traceText = await fs.readFile(path.join(diagnosticsDir, entries[0]), 'utf8');
+      const events = traceText
+        .trim()
+        .split(/\r?\n/g)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { event: string; state?: { manifestExists?: boolean; indexExists?: boolean } });
+
+      expect(events.some((event) => event.event === 'install-start')).toBe(true);
+      expect(events.some((event) => event.event === 'cache-package-publish-success')).toBe(true);
+      expect(events.some((event) => event.event === 'install-finished')).toBe(true);
+      expect(events.some((event) => event.state?.manifestExists === true)).toBe(true);
+      expect(events.some((event) => event.state?.indexExists === true)).toBe(true);
+    } finally {
+      if (previousEnv == null) {
+        delete process.env.FPI_INSTALL_DIAGNOSTICS;
+      } else {
+        process.env.FPI_INSTALL_DIAGNOSTICS = previousEnv;
+      }
+      await fs.remove(diagnosticCachePath);
+    }
+  }, TIMEOUT);
+
   it('should get a valid package index file after install', async () => {
     await customCacheFpi.install(testPkg);
     const index = await customCacheFpi.getPackageIndexFile(tstPkgAt);
