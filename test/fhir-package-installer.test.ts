@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { spawn } from 'node:child_process';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import fs from 'fs-extra';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
@@ -19,6 +21,121 @@ const noopLogger: Logger = {
 // Helper to sort index entries by 'filename'
 function sortIndexEntries(entries: FileInPackageIndex[]): FileInPackageIndex[] {
   return entries.slice().sort((a, b) => a.filename.localeCompare(b.filename));
+}
+
+type ConcurrentInstallWorkerPayload = {
+  workerId: string;
+  ok?: boolean;
+  message?: string;
+  stack?: string | null;
+};
+
+type ConcurrentInstallWorkerResult = {
+  workerId: number;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  payload: ConcurrentInstallWorkerPayload | null;
+};
+
+function parseWorkerPayload(output: string): ConcurrentInstallWorkerPayload | null {
+  const lines = output
+    .trim()
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(lines[lines.length - 1]) as ConcurrentInstallWorkerPayload;
+  } catch {
+    return null;
+  }
+}
+
+async function runConcurrentInstallWorkers(args: {
+  packageId: string;
+  cachePath: string;
+  registryUrl: string;
+  workerCount?: number;
+}): Promise<ConcurrentInstallWorkerResult[]> {
+  const workerCount = args.workerCount ?? 3;
+  const moduleUrl = pathToFileURL(path.resolve('.', 'dist', 'index.mjs')).href;
+  const workerCode = `
+const noopLogger = { info: () => {}, warn: () => {}, error: () => {} };
+const { FhirPackageInstaller } = await import(process.env.SESSION4_FPI_MODULE_URL);
+const installer = new FhirPackageInstaller({
+  cachePath: process.env.SESSION4_CACHE_PATH,
+  registryUrl: process.env.SESSION4_REGISTRY_URL,
+  allowHttp: true,
+  skipExamples: true,
+  logger: noopLogger,
+});
+const workerId = process.env.SESSION4_WORKER_ID;
+try {
+  const ok = await installer.install(process.env.SESSION4_PACKAGE_ID);
+  console.log(JSON.stringify({ workerId, ok }));
+} catch (error) {
+  console.error(JSON.stringify({
+    workerId,
+    message: error?.message ?? String(error),
+    stack: error?.stack ?? null,
+  }));
+  process.exit(1);
+}
+`;
+
+  const runWorker = async (workerId: number): Promise<ConcurrentInstallWorkerResult> => {
+    return await new Promise((resolve) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', workerCode], {
+        cwd: path.resolve('.'),
+        env: {
+          ...process.env,
+          SESSION4_FPI_MODULE_URL: moduleUrl,
+          SESSION4_CACHE_PATH: args.cachePath,
+          SESSION4_REGISTRY_URL: args.registryUrl,
+          SESSION4_PACKAGE_ID: args.packageId,
+          SESSION4_WORKER_ID: String(workerId),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on('close', (code) => {
+        resolve({
+          workerId,
+          code,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          payload: parseWorkerPayload(stdout || stderr),
+        });
+      });
+    });
+  };
+
+  return await Promise.all(Array.from({ length: workerCount }, (_, index) => runWorker(index + 1)));
+}
+
+async function expectMaterializedPackage(cachePath: string, packageId: { id: string; version: string }, expectedFiles: string[]): Promise<void> {
+  const packageDir = path.join(cachePath, `${packageId.id}#${packageId.version}`, 'package');
+  const indexPath = path.join(packageDir, '.fpi.index.json');
+  const index = await fs.readJSON(indexPath, { encoding: 'utf8' }) as { files: Array<{ filename: string }> };
+
+  expect(Array.isArray(index.files)).toBe(true);
+  expect(sortIndexEntries(index.files as FileInPackageIndex[]).map((file) => file.filename)).toEqual([...expectedFiles].sort());
+  for (const filename of expectedFiles) {
+    expect(await fs.exists(path.join(packageDir, filename))).toBe(true);
+  }
 }
 
 // Keep this for quickly toggling a few edge-case tests while iterating locally.
@@ -158,46 +275,170 @@ describe('fhir-package-installer module', () => {
     expect(await customCacheFpi.isInstalled(testPkg)).toBe(true);
   }, TIMEOUT);
 
-  it('should write install diagnostics when enabled', async () => {
-    const previousEnv = process.env.FPI_INSTALL_DIAGNOSTICS;
-    process.env.FPI_INSTALL_DIAGNOSTICS = '1';
-
-    const diagnosticCachePath = createTempDir();
-    const diagnosticFpi = new FhirPackageInstaller({
-      cachePath: diagnosticCachePath,
+  it('should repair incomplete visible package directories before treating them as installed', async () => {
+    const repairCachePath = createTempDir();
+    const repairFpi = new FhirPackageInstaller({
+      cachePath: repairCachePath,
       skipExamples: true,
       allowHttp: true,
       registryUrl: registry.getBaseUrl(),
       logger: noopLogger,
     });
 
+    const packageDir = path.join(repairCachePath, `${testPkg.id}#${testPkg.version}`, 'package');
+    await fs.ensureDir(packageDir);
+    await fs.writeJSON(path.join(packageDir, 'package.json'), {
+      name: testPkg.id,
+      version: testPkg.version,
+      dependencies: {},
+    });
+    await fs.writeJSON(path.join(packageDir, '.fpi.index.json'), {
+      'index-version': 2,
+      files: [{
+        filename: 'ValueSet-test.json',
+        resourceType: 'ValueSet',
+        id: 'test',
+        url: 'http://example.org/ValueSet/test',
+        name: 'TestVS',
+        version: '1.0.0',
+      }],
+    });
+
     try {
-      const result = await diagnosticFpi.install(testPkg);
+      expect(await repairFpi.isInstalled(testPkg, { deep: false })).toBe(false);
+
+      const result = await repairFpi.install(testPkg);
       expect(result).toBe(true);
+      expect(await repairFpi.isInstalled(testPkg)).toBe(true);
+      expect(await fs.exists(path.join(packageDir, 'ValueSet-test.json'))).toBe(true);
+      expect(await fs.exists(path.join(packageDir, 'CodeSystem-test.json'))).toBe(true);
 
-      const diagnosticsDir = path.join(diagnosticCachePath, '.fpi.cache', 'diagnostics');
-      const entries = await fs.readdir(diagnosticsDir);
-      expect(entries.length).toBe(1);
-
-      const traceText = await fs.readFile(path.join(diagnosticsDir, entries[0]), 'utf8');
-      const events = traceText
-        .trim()
-        .split(/\r?\n/g)
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: string; state?: { manifestExists?: boolean; indexExists?: boolean } });
-
-      expect(events.some((event) => event.event === 'install-start')).toBe(true);
-      expect(events.some((event) => event.event === 'cache-package-publish-success')).toBe(true);
-      expect(events.some((event) => event.event === 'install-finished')).toBe(true);
-      expect(events.some((event) => event.state?.manifestExists === true)).toBe(true);
-      expect(events.some((event) => event.state?.indexExists === true)).toBe(true);
+      const repairedIndex = await repairFpi.getPackageIndexFile(testPkg);
+      expect(repairedIndex.files).toHaveLength(2);
     } finally {
-      if (previousEnv == null) {
-        delete process.env.FPI_INSTALL_DIAGNOSTICS;
-      } else {
-        process.env.FPI_INSTALL_DIAGNOSTICS = previousEnv;
+      await fs.remove(repairCachePath);
+    }
+  }, TIMEOUT);
+
+  it('should generate .fpi.index.json in place for legacy-complete packages without reinstalling', async () => {
+    const compatibilityCachePath = createTempDir();
+    const compatibilityFpi = new FhirPackageInstaller({
+      cachePath: compatibilityCachePath,
+      skipExamples: true,
+      registryUrl: 'n/a',
+      logger: noopLogger,
+    });
+
+    const packageDir = path.join(compatibilityCachePath, `${testPkg.id}#${testPkg.version}`, 'package');
+    const legacyIndexPath = path.join(packageDir, '.index.json');
+    const fpiIndexPath = path.join(packageDir, '.fpi.index.json');
+    const sentinelPath = path.join(packageDir, 'compatibility-sentinel.txt');
+
+    await fs.ensureDir(packageDir);
+    await fs.writeJSON(path.join(packageDir, 'package.json'), {
+      name: testPkg.id,
+      version: testPkg.version,
+      dependencies: {},
+    });
+    await fs.writeJSON(path.join(packageDir, 'ValueSet-test.json'), {
+      resourceType: 'ValueSet',
+      id: 'test',
+      url: 'http://example.org/ValueSet/test',
+      name: 'TestVS',
+      version: '1.0.0',
+    });
+    await fs.writeJSON(path.join(packageDir, 'CodeSystem-test.json'), {
+      resourceType: 'CodeSystem',
+      id: 'test',
+      url: 'http://example.org/CodeSystem/test',
+      name: 'TestCS',
+      version: '1.0.0',
+      content: 'complete',
+    });
+    await fs.writeJSON(legacyIndexPath, {
+      'index-version': 2,
+      files: [
+        {
+          filename: 'ValueSet-test.json',
+          resourceType: 'ValueSet',
+          id: 'test',
+          url: 'http://example.org/ValueSet/test',
+          name: 'TestVS',
+          version: '1.0.0',
+        },
+        {
+          filename: 'CodeSystem-test.json',
+          resourceType: 'CodeSystem',
+          id: 'test',
+          url: 'http://example.org/CodeSystem/test',
+          name: 'TestCS',
+          version: '1.0.0',
+          content: 'complete',
+        },
+      ],
+    });
+    await fs.writeFile(sentinelPath, 'keep-me');
+
+    try {
+      expect(await fs.exists(fpiIndexPath)).toBe(false);
+      expect(await compatibilityFpi.isInstalled(testPkg, { deep: false })).toBe(true);
+      expect(await fs.exists(fpiIndexPath)).toBe(true);
+
+      const result = await compatibilityFpi.install(testPkg);
+      expect(result).toBe(true);
+      expect(await fs.readFile(sentinelPath, 'utf8')).toBe('keep-me');
+      expect(await compatibilityFpi.isInstalled(testPkg)).toBe(true);
+
+      const generatedIndex = await fs.readJSON(fpiIndexPath, { encoding: 'utf8' });
+      expect(generatedIndex.files).toHaveLength(2);
+    } finally {
+      await fs.remove(compatibilityCachePath);
+    }
+  }, TIMEOUT);
+
+  it('should install the same package concurrently across processes into one shared cache', async () => {
+    const sharedCachePath = createTempDir();
+
+    try {
+      const results = await runConcurrentInstallWorkers({
+        packageId: tstPkgAt,
+        cachePath: sharedCachePath,
+        registryUrl: registry.getBaseUrl(),
+      });
+
+      for (const result of results) {
+        expect(result.code).toBe(0);
+        expect(result.payload).toMatchObject({ workerId: String(result.workerId), ok: true });
       }
-      await fs.remove(diagnosticCachePath);
+
+      await expectMaterializedPackage(sharedCachePath, testPkg, [
+        'CodeSystem-test.json',
+        'ValueSet-test.json',
+      ]);
+    } finally {
+      await fs.remove(sharedCachePath);
+    }
+  }, TIMEOUT);
+
+  it('should install a dependency chain concurrently across processes into one shared cache', async () => {
+    const sharedCachePath = createTempDir();
+
+    try {
+      const results = await runConcurrentInstallWorkers({
+        packageId: `${rootPkg.id}@${rootPkg.version}`,
+        cachePath: sharedCachePath,
+        registryUrl: registry.getBaseUrl(),
+      });
+
+      for (const result of results) {
+        expect(result.code).toBe(0);
+        expect(result.payload).toMatchObject({ workerId: String(result.workerId), ok: true });
+      }
+
+      await expectMaterializedPackage(sharedCachePath, rootPkg, ['StructureDefinition-root.json']);
+      await expectMaterializedPackage(sharedCachePath, depPkg, ['StructureDefinition-dep.json']);
+    } finally {
+      await fs.remove(sharedCachePath);
     }
   }, TIMEOUT);
 
