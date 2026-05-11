@@ -66,7 +66,10 @@ async function runConcurrentInstallWorkers(args: {
 }): Promise<ConcurrentInstallWorkerResult[]> {
   const workerCount = args.workerCount ?? 3;
   const moduleUrl = pathToFileURL(path.resolve('.', 'dist', 'index.mjs')).href;
+  const startBarrierDir = path.join(args.cachePath, '.test-worker-start-barrier');
   const workerCode = `
+const fs = await import('node:fs/promises');
+const path = await import('node:path');
 const makeLogger = () => {
   if (process.env.SESSION4_LOGGER_MODE !== 'debug') {
     return { info: () => {}, warn: () => {}, error: () => {} };
@@ -87,7 +90,39 @@ const installer = new FhirPackageInstaller({
   logger: makeLogger(),
 });
 const workerId = process.env.SESSION4_WORKER_ID;
+
+const waitForStartBarrier = async () => {
+  const barrierDir = process.env.SESSION4_START_BARRIER_DIR;
+  const expectedWorkers = Number(process.env.SESSION4_START_BARRIER_COUNT ?? '1');
+  if (!barrierDir || expectedWorkers <= 1) {
+    return;
+  }
+
+  const timeoutMs = Number(process.env.SESSION4_START_BARRIER_TIMEOUT_MS ?? '10000');
+  const settleMs = Number(process.env.SESSION4_START_BARRIER_SETTLE_MS ?? '100');
+  const startedAt = Date.now();
+  await fs.mkdir(barrierDir, { recursive: true });
+  await fs.writeFile(path.join(barrierDir, String(workerId) + '.ready'), 'ready', 'utf8');
+
+  while (true) {
+    const readyFiles = (await fs.readdir(barrierDir)).filter((filename) => filename.endsWith('.ready'));
+    if (readyFiles.length >= expectedWorkers) {
+      if (settleMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, settleMs));
+      }
+      return;
+    }
+
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error('Timed out waiting for ' + expectedWorkers + ' concurrent test workers to reach the start barrier.');
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
+
 try {
+  await waitForStartBarrier();
   const ok = await installer.install(process.env.SESSION4_PACKAGE_ID);
   console.log(JSON.stringify({ workerId, ok }));
 } catch (error) {
@@ -112,6 +147,10 @@ try {
           SESSION4_PACKAGE_ID: args.packageId,
           SESSION4_WORKER_ID: String(workerId),
           SESSION4_LOGGER_MODE: args.loggerMode ?? 'noop',
+          SESSION4_START_BARRIER_DIR: startBarrierDir,
+          SESSION4_START_BARRIER_COUNT: String(workerCount),
+          SESSION4_START_BARRIER_TIMEOUT_MS: '10000',
+          SESSION4_START_BARRIER_SETTLE_MS: '100',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
