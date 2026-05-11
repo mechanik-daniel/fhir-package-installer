@@ -50,9 +50,11 @@ const registerTempCleanup = (): void => {
   });
 };
 
-const createTempDir = (): string => {
+const createTempDir = (baseDir?: string): string => {
   registerTempCleanup();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fhir-package-installer-'));
+  const parentDir = baseDir ?? os.tmpdir();
+  fs.ensureDirSync(parentDir);
+  const dir = fs.mkdtempSync(path.join(parentDir, 'fhir-package-installer-'));
   tempDirs.add(dir);
   return dir;
 };
@@ -69,6 +71,11 @@ const FPI_INDEX_CACHE_VERSION = (() => {
   return `${v.major}.${v.minor}`;
 })();
 const FPI_STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const FPI_MATERIALIZATION_MARKER = '.fpi.materialized';
+const DEPENDENCY_CLAIM_WAIT_MS = 1000;
+const DEPENDENCY_POST_CLAIM_YIELD_MS = 500;
+const DEPENDENCY_WAIT_LOG_INTERVAL_MS = 5000;
+const PACKAGE_INSTALL_WAIT_LOG_INTERVAL_MS = 5000;
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
@@ -106,6 +113,12 @@ const MEM_CACHE_MAX_ENTRIES = 500;
 type BoundedTtlEntry<V> = {
   value: V;
   expiresAt: number;
+};
+
+type GetDependenciesOptions = {
+  rootPackage?: string | FhirPackageIdentifier;
+  explicitImplicitVersions?: ReadonlyMap<string, string>;
+  includePlanningFallbacks?: boolean;
 };
 
 // Lightweight bounded TTL cache with LRU-ish behavior via Map insertion order.
@@ -381,6 +394,71 @@ export class FhirPackageInstaller {
   private allowHttp = false; // allow HTTP URLs for testing
   private resolvingImplicitDeps = new Set<string>();
   private installingPackages = new Set<string>();
+
+  private formatPackageForDebug(packageObject: FhirPackageIdentifier): string {
+    return `${packageObject.id}@${packageObject.version}`;
+  }
+
+  private formatMaterializationStatusForDebug(status: {
+    complete: boolean;
+    reason: string;
+    missingFiles: string[];
+  }): string {
+    const missingPreview = status.missingFiles.length > 0
+      ? ` missingFiles=${status.missingFiles.slice(0, 3).join(',')}${status.missingFiles.length > 3 ? ',...' : ''}`
+      : '';
+    return `materialization=${status.complete ? 'complete' : 'incomplete'} reason=${status.reason}${missingPreview}`;
+  }
+
+  private async describePackageInstallWaitState(packageObject: FhirPackageIdentifier): Promise<string> {
+    try {
+      const status = await this.getPackageMaterializationStatus(packageObject, { emitTiming: true });
+      return this.formatMaterializationStatusForDebug(status);
+    } catch (error) {
+      return `materialization-check-error=${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private formatElapsedMs(startedAtNs: bigint): string {
+    return (Number(process.hrtime.bigint() - startedAtNs) / 1_000_000).toFixed(1);
+  }
+
+  private async withDebugTiming<T>(
+    label: string,
+    action: () => Promise<T>,
+    describeResult?: (result: T) => string
+  ): Promise<T> {
+    if (!this.logger.debug) {
+      return await action();
+    }
+
+    const startedAtNs = process.hrtime.bigint();
+    try {
+      const result = await action();
+      const resultText = describeResult ? ` ${describeResult(result)}` : '';
+      this.logger.debug(`[timing] ${label} completed in ${this.formatElapsedMs(startedAtNs)}ms.${resultText}`);
+      return result;
+    } catch (error) {
+      this.logger.debug(
+        `[timing] ${label} failed in ${this.formatElapsedMs(startedAtNs)}ms: ${error instanceof Error ? error.message : String(error)}`
+      );
+      throw error;
+    }
+  }
+
+  private getPackageKey(packageObject: FhirPackageIdentifier): string {
+    return `${packageObject.id}#${packageObject.version}`;
+  }
+
+  private normalizeDependencies(dependencies: Record<string, string>): Record<string, string> {
+    if (dependencies['hl7.fhir.r4.core'] === '4.0.0') {
+      return {
+        ...dependencies,
+        'hl7.fhir.r4.core': '4.0.1',
+      };
+    }
+    return dependencies;
+  }
   
   constructor(config?: FpiConfig) {
     const {
@@ -561,7 +639,16 @@ export class FhirPackageInstaller {
     return path.join(homeDir, '.fhir', 'packages');
   }
 
-  private async withDiskLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+  private async withDiskLock<T>(
+    lockKey: string,
+    fn: () => Promise<T>,
+    options?: {
+      debugLabel?: string;
+      describeWaitState?: () => Promise<string>;
+      waitLogIntervalMs?: number;
+      proceedWithoutLockAfterTimeout?: boolean;
+    }
+  ): Promise<T> {
     // Lock files live under cachePath so we never write outside user-controlled boundaries.
     const locksDir = await this.ensureDiskCacheSubdir('locks');
     const lockPath = path.join(locksDir, `${sha256Hex(lockKey)}.lock`);
@@ -569,11 +656,36 @@ export class FhirPackageInstaller {
     const start = Date.now();
     const maxWaitMs = Math.max(1000, this.requestTimeoutMs);
     const staleMs = Math.max(2 * 60 * 1000, maxWaitMs * 2);
+    const debugLabel = options?.debugLabel?.trim();
+    const debugEnabled = Boolean(debugLabel) && typeof this.logger.debug === 'function';
+    const waitLogIntervalMs = Math.max(250, options?.waitLogIntervalMs ?? PACKAGE_INSTALL_WAIT_LOG_INTERVAL_MS);
+    const proceedWithoutLockAfterTimeout = options?.proceedWithoutLockAfterTimeout ?? true;
+    let contentionObserved = false;
+    let lastWaitLogAt = 0;
+
+    const readWaitState = async (): Promise<string | null> => {
+      if (!debugEnabled || !options?.describeWaitState) {
+        return null;
+      }
+      try {
+        return await options.describeWaitState();
+      } catch (error) {
+        return `wait-state-error=${error instanceof Error ? error.message : String(error)}`;
+      }
+    };
 
     while (true) {
       try {
         await fs.ensureDir(path.dirname(lockPath));
         await fs.writeFile(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: 'wx' });
+        if (debugEnabled) {
+          const waitedMs = Date.now() - start;
+          this.logger.debug?.(
+            contentionObserved
+              ? `Claimed ${debugLabel} after waiting ${waitedMs}ms.`
+              : `Claimed ${debugLabel}.`
+          );
+        }
         const heartbeat = setInterval(() => {
           // Keep mtime fresh so waiters can distinguish live vs stale locks.
           fs.utimes(lockPath, new Date(), new Date()).catch(() => undefined);
@@ -584,17 +696,46 @@ export class FhirPackageInstaller {
         } finally {
           clearInterval(heartbeat);
           await fs.remove(lockPath).catch(() => undefined);
+          if (debugEnabled) {
+            this.logger.debug?.(`Released ${debugLabel}.`);
+          }
         }
       } catch (e: any) {
         if (e?.code !== 'EEXIST') {
           // If locking fails for other reasons, don't break functionality.
+          if (debugEnabled) {
+            this.logger.debug?.(
+              `Skipping ${debugLabel} because the lock could not be created (${e?.code || e?.message || String(e)}); proceeding without the lock.`
+            );
+          }
           return await fn();
         }
+
+        const elapsedMs = Date.now() - start;
+        let lockAgeMs: number | null = null;
+        let waitState: string | null = null;
+
+        if (!contentionObserved && debugEnabled) {
+          waitState = await readWaitState();
+          this.logger.debug?.(
+            `Another process holds ${debugLabel}; entering wait loop.` +
+            `${waitState ? ` Current materialization state: ${waitState}.` : ''}`
+          );
+        }
+        contentionObserved = true;
 
         // If the lock looks stale, attempt to break it.
         try {
           const stat = await fs.stat(lockPath);
-          if (Date.now() - stat.mtimeMs > staleMs) {
+          lockAgeMs = Date.now() - stat.mtimeMs;
+          if (lockAgeMs > staleMs) {
+            if (debugEnabled) {
+              waitState ??= await readWaitState();
+              this.logger.debug?.(
+                `Breaking stale ${debugLabel} after waiting ${elapsedMs}ms (lockAgeMs=${Math.round(lockAgeMs)}).` +
+                `${waitState ? ` Current materialization state: ${waitState}.` : ''}`
+              );
+            }
             await fs.remove(lockPath).catch(() => undefined);
             continue;
           }
@@ -603,12 +744,84 @@ export class FhirPackageInstaller {
         }
 
         if (Date.now() - start > maxWaitMs) {
-          // Avoid deadlocks: proceed without the lock after waiting.
-          return await fn();
+          if (proceedWithoutLockAfterTimeout) {
+            // Avoid deadlocks: proceed without the lock after waiting.
+            if (debugEnabled) {
+              waitState ??= await readWaitState();
+              this.logger.debug?.(
+                `Waited ${elapsedMs}ms for ${debugLabel}, exceeding maxWaitMs=${maxWaitMs}; proceeding without the lock.` +
+                `${waitState ? ` Current materialization state: ${waitState}.` : ''}`
+              );
+            }
+            return await fn();
+          }
+
+          if (debugEnabled && (Date.now() - lastWaitLogAt >= waitLogIntervalMs)) {
+            waitState ??= await readWaitState();
+            this.logger.debug?.(
+              `Waited ${elapsedMs}ms for ${debugLabel}, exceeding maxWaitMs=${maxWaitMs}; continuing to wait for the live lock holder.` +
+              `${waitState ? ` Current materialization state: ${waitState}.` : ''}`
+            );
+            lastWaitLogAt = Date.now();
+          }
+        }
+
+        if (debugEnabled && (Date.now() - lastWaitLogAt >= waitLogIntervalMs)) {
+          waitState ??= await readWaitState();
+          const lockAgeText = typeof lockAgeMs === 'number' ? ` lockAgeMs=${Math.round(lockAgeMs)}.` : '';
+          this.logger.debug?.(
+            `Still waiting for ${debugLabel} after ${elapsedMs}ms.${lockAgeText}` +
+            `${waitState ? ` Current materialization state: ${waitState}.` : ''}`
+          );
+          lastWaitLogAt = Date.now();
         }
 
         await new Promise((r) => setTimeout(r, 50 + Math.floor(Math.random() * 100)));
       }
+    }
+  }
+
+  private async tryWithDiskLock<T>(
+    lockKey: string,
+    fn: () => Promise<T>,
+    options?: {
+      debugLabel?: string;
+    }
+  ): Promise<{ acquired: true; result: T } | { acquired: false }> {
+    const locksDir = await this.ensureDiskCacheSubdir('locks');
+    const lockPath = path.join(locksDir, `${sha256Hex(lockKey)}.lock`);
+    const debugLabel = options?.debugLabel?.trim();
+    const debugEnabled = Boolean(debugLabel) && typeof this.logger.debug === 'function';
+
+    try {
+      await fs.ensureDir(path.dirname(lockPath));
+      await fs.writeFile(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: 'wx' });
+      if (debugEnabled) {
+        this.logger.debug?.(`Claimed ${debugLabel}.`);
+      }
+      const heartbeat = setInterval(() => {
+        fs.utimes(lockPath, new Date(), new Date()).catch(() => undefined);
+      }, 1000);
+      (heartbeat as any).unref?.();
+      try {
+        return { acquired: true, result: await fn() };
+      } finally {
+        clearInterval(heartbeat);
+        await fs.remove(lockPath).catch(() => undefined);
+        if (debugEnabled) {
+          this.logger.debug?.(`Released ${debugLabel}.`);
+        }
+      }
+    } catch (e: any) {
+      if (e?.code === 'EEXIST') {
+        return { acquired: false };
+      }
+      if (debugEnabled) {
+        this.logger.debug?.(
+          `Skipping ${debugLabel} because the lock could not be created (${e?.code || e?.message || String(e)}); proceeding without the lock.`
+        );
+      }
+      return { acquired: true, result: await fn() };
     }
   }
 
@@ -617,6 +830,19 @@ export class FhirPackageInstaller {
     const dir = path.join(this.cachePath, '.fpi.cache', name);
     await fs.ensureDir(dir);
     return dir;
+  }
+
+  private async createWorkingTempDir(options?: { preferCache?: boolean }): Promise<string> {
+    if (options?.preferCache !== false) {
+      try {
+        const cacheTempRoot = await this.ensureDiskCacheSubdir('tmp');
+        return createTempDir(cacheTempRoot);
+      } catch {
+        // Fall back to the process temp directory if the cache-local temp root is unavailable.
+      }
+    }
+
+    return createTempDir();
   }
 
   private getPackageInstallLockKey(packageObject: FhirPackageIdentifier): string {
@@ -630,6 +856,19 @@ export class FhirPackageInstaller {
     const lockKey = this.getPackageInstallLockKey(packageObject);
     return await this.withDiskLock(lockKey, async () => {
       return await fn();
+    }, {
+      debugLabel: `package install ${this.formatPackageForDebug(packageObject)}`,
+      describeWaitState: async () => await this.describePackageInstallWaitState(packageObject),
+      proceedWithoutLockAfterTimeout: false,
+    });
+  }
+
+  private async tryWithPackageInstallLock<T>(
+    packageObject: FhirPackageIdentifier,
+    fn: () => Promise<T>
+  ): Promise<{ acquired: true; result: T } | { acquired: false }> {
+    return await this.tryWithDiskLock(this.getPackageInstallLockKey(packageObject), fn, {
+      debugLabel: `package install ${this.formatPackageForDebug(packageObject)}`,
     });
   }
 
@@ -668,25 +907,44 @@ export class FhirPackageInstaller {
   }
 
   private async buildPackageIndexFromPackageDir(packageDir: string): Promise<PackageIndex> {
-    const fileList = await fs.readdir(packageDir);
-    const files = await Promise.all(
-      fileList.filter(
-        file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
-      ).map(
-        file => limit(
-          async () => {
-            const contentText = await fs.readFile(path.join(packageDir, file), { encoding: 'utf8' });
-            const content = JSON.parse(contentText) as PackageResource;
-            return extractResourceIndexEntry(file, content);
-          }
-        )
-      )
-    );
+    return await this.withDebugTiming(
+      `build-package-index packageDir=${packageDir}`,
+      async () => {
+        const discoverStartedAtNs = process.hrtime.bigint();
+        const fileList = await fs.readdir(packageDir);
+        const candidateFiles = fileList.filter(
+          file => file.endsWith('.json') && file !== 'package.json' && !file.endsWith('.index.json')
+        );
+        this.logger.debug?.(
+          `[index] Discovered ${candidateFiles.length} candidate JSON resources in ${packageDir} ` +
+          `in ${this.formatElapsedMs(discoverStartedAtNs)}ms.`
+        );
 
-    return {
-      'index-version': 2,
-      files,
-    };
+        const parseStartedAtNs = process.hrtime.bigint();
+        const files = await Promise.all(
+          candidateFiles.map(
+            file => limit(
+              async () => {
+                const contentText = await fs.readFile(path.join(packageDir, file), { encoding: 'utf8' });
+                const content = JSON.parse(contentText) as PackageResource;
+                return extractResourceIndexEntry(file, content);
+              }
+            )
+          )
+        );
+
+        this.logger.debug?.(
+          `[index] Parsed ${files.length} resource entries from ${packageDir} ` +
+          `in ${this.formatElapsedMs(parseStartedAtNs)}ms.`
+        );
+
+        return {
+          'index-version': 2,
+          files,
+        };
+      },
+      (indexJson) => `fileCount=${indexJson.files.length}`
+    );
   }
 
   private normalizeIndexEntry(entry: Record<string, unknown>): FileInPackageIndex | null {
@@ -807,33 +1065,42 @@ export class FhirPackageInstaller {
     packageObject: FhirPackageIdentifier,
     packageDir: string
   ): Promise<PackageIndex> {
-    const memKey = this.getIndexMemKey(packageObject);
-    const memHit = memGet<PackageIndex>(memKey);
-    if (memHit) {
-      return await this.persistMaterializedPackageIndex(packageObject, packageDir, memHit);
-    }
+    return await this.withDebugTiming(
+      `materialize-package-index ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        const memKey = this.getIndexMemKey(packageObject);
+        const memHit = memGet<PackageIndex>(memKey);
+        if (memHit) {
+          return await this.persistMaterializedPackageIndex(packageObject, packageDir, memHit);
+        }
 
-    return await this.withDiskLock(this.getIndexDiskLockKey(packageObject), async () => {
-      const memHit2 = memGet<PackageIndex>(memKey);
-      if (memHit2) {
-        return await this.persistMaterializedPackageIndex(packageObject, packageDir, memHit2);
-      }
+        return await this.withDiskLock(this.getIndexDiskLockKey(packageObject), async () => {
+          const memHit2 = memGet<PackageIndex>(memKey);
+          if (memHit2) {
+            return await this.persistMaterializedPackageIndex(packageObject, packageDir, memHit2);
+          }
 
-      const diskPath = this.getDiskIndexCachePath(packageObject);
-      const diskHit = await withSingleFlight(inFlightIndex, `disk-${memKey}`, async () => {
-        await this.ensureDiskCacheSubdir('indexes');
-        return await this.readDiskCacheJson<PackageIndex>(diskPath);
-      });
-      if (diskHit) {
-        return await this.persistMaterializedPackageIndex(packageObject, packageDir, diskHit);
-      }
+          const diskPath = this.getDiskIndexCachePath(packageObject);
+          const diskHit = await withSingleFlight(inFlightIndex, `disk-${memKey}`, async () => {
+            await this.ensureDiskCacheSubdir('indexes');
+            return await this.readDiskCacheJson<PackageIndex>(diskPath);
+          });
+          if (diskHit) {
+            return await this.persistMaterializedPackageIndex(packageObject, packageDir, diskHit);
+          }
 
-      const indexJson = await this.buildPackageIndexFromPackageDir(packageDir);
-      return await this.persistMaterializedPackageIndex(packageObject, packageDir, indexJson);
-    });
+          const indexJson = await this.buildPackageIndexFromPackageDir(packageDir);
+          return await this.persistMaterializedPackageIndex(packageObject, packageDir, indexJson);
+        });
+      },
+      (indexJson) => `fileCount=${indexJson.files.length}`
+    );
   }
 
-  private async getPackageMaterializationStatus(packageObject: FhirPackageIdentifier): Promise<{
+  private async getPackageMaterializationStatus(
+    packageObject: FhirPackageIdentifier,
+    options?: { emitTiming?: boolean }
+  ): Promise<{
     complete: boolean;
     reason:
       | 'package-root-missing'
@@ -845,63 +1112,94 @@ export class FhirPackageInstaller {
       | 'indexed-files-missing';
     missingFiles: string[];
   }> {
-    const packageRoot = await this.getPackageDirPath(packageObject);
-    if (!await fs.exists(packageRoot)) {
-      return { complete: false, reason: 'package-root-missing', missingFiles: [] };
+    const computeStatus = async (): Promise<{
+      complete: boolean;
+      reason:
+        | 'package-root-missing'
+        | 'package-dir-missing'
+        | 'manifest-missing'
+        | 'manifest-invalid'
+        | 'index-missing'
+        | 'index-invalid'
+        | 'indexed-files-missing';
+      missingFiles: string[];
+    }> => {
+        const packageRoot = await this.getPackageDirPath(packageObject);
+        if (!await fs.exists(packageRoot)) {
+          return { complete: false, reason: 'package-root-missing', missingFiles: [] };
+        }
+
+        const packageDir = path.join(packageRoot, 'package');
+        if (!await fs.exists(packageDir)) {
+          return { complete: false, reason: 'package-dir-missing', missingFiles: [] };
+        }
+
+        const manifestPath = path.join(packageDir, 'package.json');
+        if (!await fs.exists(manifestPath)) {
+          return { complete: false, reason: 'manifest-missing', missingFiles: [] };
+        }
+
+        try {
+          await fs.readJSON(manifestPath, { encoding: 'utf8' });
+        } catch {
+          return { complete: false, reason: 'manifest-invalid', missingFiles: [] };
+        }
+
+        const indexPath = path.join(packageDir, '.fpi.index.json');
+        if (!await fs.exists(indexPath)) {
+          const legacyMaterializedIndex = await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir);
+          if (!legacyMaterializedIndex) {
+            return { complete: false, reason: 'index-missing', missingFiles: [] };
+          }
+          return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+        }
+
+        if (await this.hasFreshMaterializationMarker(packageRoot, packageDir, manifestPath, indexPath)) {
+          return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+        }
+
+        let indexJson: Partial<PackageIndex>;
+        try {
+          indexJson = await fs.readJSON(indexPath, { encoding: 'utf8' }) as Partial<PackageIndex>;
+        } catch {
+          return { complete: false, reason: 'index-invalid', missingFiles: [] };
+        }
+
+        if (!Array.isArray(indexJson.files)) {
+          return { complete: false, reason: 'index-invalid', missingFiles: [] };
+        }
+
+        const packageDirEntries = new Set(await fs.readdir(packageDir));
+        const missingFiles: string[] = [];
+        for (const file of indexJson.files) {
+          const filename = typeof file?.filename === 'string' ? file.filename : null;
+          if (!filename) {
+            return { complete: false, reason: 'index-invalid', missingFiles: [] };
+          }
+          const canUseDirectoryListing = !filename.includes('/') && !filename.includes('\\');
+          if (canUseDirectoryListing ? !packageDirEntries.has(filename) : !await fs.exists(path.join(packageDir, filename))) {
+            missingFiles.push(filename);
+          }
+        }
+
+        if (missingFiles.length > 0) {
+          return { complete: false, reason: 'indexed-files-missing', missingFiles };
+        }
+
+        await this.writeMaterializationMarker(packageRoot, packageDir, manifestPath, indexPath);
+
+        return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+    };
+
+    if (!options?.emitTiming) {
+      return await computeStatus();
     }
 
-    const packageDir = path.join(packageRoot, 'package');
-    if (!await fs.exists(packageDir)) {
-      return { complete: false, reason: 'package-dir-missing', missingFiles: [] };
-    }
-
-    const manifestPath = path.join(packageDir, 'package.json');
-    if (!await fs.exists(manifestPath)) {
-      return { complete: false, reason: 'manifest-missing', missingFiles: [] };
-    }
-
-    try {
-      await fs.readJSON(manifestPath, { encoding: 'utf8' });
-    } catch {
-      return { complete: false, reason: 'manifest-invalid', missingFiles: [] };
-    }
-
-    const indexPath = path.join(packageDir, '.fpi.index.json');
-    if (!await fs.exists(indexPath)) {
-      const legacyMaterializedIndex = await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir);
-      if (!legacyMaterializedIndex) {
-        return { complete: false, reason: 'index-missing', missingFiles: [] };
-      }
-      return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
-    }
-
-    let indexJson: Partial<PackageIndex>;
-    try {
-      indexJson = await fs.readJSON(indexPath, { encoding: 'utf8' }) as Partial<PackageIndex>;
-    } catch {
-      return { complete: false, reason: 'index-invalid', missingFiles: [] };
-    }
-
-    if (!Array.isArray(indexJson.files)) {
-      return { complete: false, reason: 'index-invalid', missingFiles: [] };
-    }
-
-    const missingFiles: string[] = [];
-    for (const file of indexJson.files) {
-      const filename = typeof file?.filename === 'string' ? file.filename : null;
-      if (!filename) {
-        return { complete: false, reason: 'index-invalid', missingFiles: [] };
-      }
-      if (!await fs.exists(path.join(packageDir, filename))) {
-        missingFiles.push(filename);
-      }
-    }
-
-    if (missingFiles.length > 0) {
-      return { complete: false, reason: 'indexed-files-missing', missingFiles };
-    }
-
-    return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+    return await this.withDebugTiming(
+      `materialization-status ${this.formatPackageForDebug(packageObject)}`,
+      computeStatus,
+      (status) => this.formatMaterializationStatusForDebug(status)
+    );
   }
 
   private async stagePackageForPublish(
@@ -909,22 +1207,54 @@ export class FhirPackageInstaller {
     src: string,
     move: boolean
   ): Promise<string> {
-    const stagingRoot = await this.createStagingDirectory(packageObject);
-    const sourcePackageDir = await fs.exists(path.join(src, 'package')) ? path.join(src, 'package') : src;
-    const stagingPackageDir = path.join(stagingRoot, 'package');
+    return await this.withDebugTiming(
+      `stage-package-for-publish ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        const stagingRoot = await this.createStagingDirectory(packageObject);
+        const sourcePackageDir = await fs.exists(path.join(src, 'package')) ? path.join(src, 'package') : src;
+        const stagingPackageDir = path.join(stagingRoot, 'package');
+        const packageLabel = this.formatPackageForDebug(packageObject);
 
-    try {
-      const action = move ? fs.move : fs.copy;
-      await action(sourcePackageDir, stagingPackageDir, { overwrite: false });
-      if (move && sourcePackageDir !== src) {
-        await fs.remove(src).catch(() => undefined);
+        try {
+          const action = move ? fs.move : fs.copy;
+          const copyOrMoveStartedAtNs = process.hrtime.bigint();
+          await action(sourcePackageDir, stagingPackageDir, { overwrite: false });
+          this.logger.debug?.(
+            `[publish] ${move ? 'Moved' : 'Copied'} staged contents for ${packageLabel} ` +
+            `from ${sourcePackageDir} to ${stagingPackageDir} in ${this.formatElapsedMs(copyOrMoveStartedAtNs)}ms.`
+          );
+          if (move && sourcePackageDir !== src) {
+            const cleanupStartedAtNs = process.hrtime.bigint();
+            await fs.remove(src).catch(() => undefined);
+            this.logger.debug?.(
+              `[publish] Removed extraction root ${src} after staging ${packageLabel} ` +
+              `in ${this.formatElapsedMs(cleanupStartedAtNs)}ms.`
+            );
+          }
+          const materializeIndexStartedAtNs = process.hrtime.bigint();
+          const materializedIndex = await this.materializePackageIndex(packageObject, stagingPackageDir);
+          this.logger.debug?.(
+            `[publish] Materialized package index for ${packageLabel} in staging ` +
+            `in ${this.formatElapsedMs(materializeIndexStartedAtNs)}ms (fileCount=${materializedIndex.files.length}).`
+          );
+          const markerStartedAtNs = process.hrtime.bigint();
+          await this.writeMaterializationMarker(
+            stagingRoot,
+            stagingPackageDir,
+            path.join(stagingPackageDir, 'package.json'),
+            path.join(stagingPackageDir, '.fpi.index.json')
+          );
+          this.logger.debug?.(
+            `[publish] Wrote materialization marker for ${packageLabel} ` +
+            `in ${this.formatElapsedMs(markerStartedAtNs)}ms.`
+          );
+          return stagingRoot;
+        } catch (error) {
+          await fs.remove(stagingRoot).catch(() => undefined);
+          throw error;
+        }
       }
-      await this.materializePackageIndex(packageObject, stagingPackageDir);
-      return stagingRoot;
-    } catch (error) {
-      await fs.remove(stagingRoot).catch(() => undefined);
-      throw error;
-    }
+    );
   }
 
   private getDiskCacheKeyPrefix(): string {
@@ -1036,6 +1366,72 @@ export class FhirPackageInstaller {
     return `index-cache|${FPI_INDEX_CACHE_VERSION}|${packageObject.id}#${packageObject.version}`;
   }
 
+  private getMaterializationMarkerPath(packageRoot: string): string {
+    return path.join(packageRoot, FPI_MATERIALIZATION_MARKER);
+  }
+
+  private async writeMaterializationMarker(
+    packageRoot: string,
+    packageDir: string,
+    manifestPath: string,
+    indexPath: string
+  ): Promise<void> {
+    const markerPath = this.getMaterializationMarkerPath(packageRoot);
+    const tmpPath = `${markerPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      const [packageDirStat, manifestStat, indexStat] = await Promise.all([
+        fs.stat(packageDir),
+        fs.stat(manifestPath),
+        fs.stat(indexPath),
+      ]);
+      await fs.writeJSON(tmpPath, {
+        packageDirMtimeMs: packageDirStat.mtimeMs,
+        packageDirCtimeMs: packageDirStat.ctimeMs,
+        manifestMtimeMs: manifestStat.mtimeMs,
+        manifestCtimeMs: manifestStat.ctimeMs,
+        indexMtimeMs: indexStat.mtimeMs,
+        indexCtimeMs: indexStat.ctimeMs,
+      });
+      await fs.move(tmpPath, markerPath, { overwrite: true });
+    } catch {
+      // best-effort cache hint
+    } finally {
+      await fs.remove(tmpPath).catch(() => undefined);
+    }
+  }
+
+  private async hasFreshMaterializationMarker(
+    packageRoot: string,
+    packageDir: string,
+    manifestPath: string,
+    indexPath: string
+  ): Promise<boolean> {
+    const markerPath = this.getMaterializationMarkerPath(packageRoot);
+    try {
+      const [marker, packageDirStat, manifestStat, indexStat] = await Promise.all([
+        fs.readJSON(markerPath, { encoding: 'utf8' }) as Promise<{
+          packageDirMtimeMs: number;
+          packageDirCtimeMs: number;
+          manifestMtimeMs: number;
+          manifestCtimeMs: number;
+          indexMtimeMs: number;
+          indexCtimeMs: number;
+        }>,
+        fs.stat(packageDir),
+        fs.stat(manifestPath),
+        fs.stat(indexPath),
+      ]);
+      return marker.packageDirMtimeMs === packageDirStat.mtimeMs
+        && marker.packageDirCtimeMs === packageDirStat.ctimeMs
+        && marker.manifestMtimeMs === manifestStat.mtimeMs
+        && marker.manifestCtimeMs === manifestStat.ctimeMs
+        && marker.indexMtimeMs === indexStat.mtimeMs
+        && marker.indexCtimeMs === indexStat.ctimeMs;
+    } catch {
+      return false;
+    }
+  }
+
   private isRegistryDisabled(): boolean {
     return this.registryDisabled;
   }
@@ -1044,14 +1440,53 @@ export class FhirPackageInstaller {
     return `FHIR package registry is disabled (registryUrl=n/a). ${detail}`;
   }
 
-  private async packageManifestExists(packageObject: FhirPackageIdentifier): Promise<boolean> {
-    const packageDir = await this.getPackageDirPath(packageObject);
-    return await fs.exists(path.join(packageDir, 'package', 'package.json'));
+  private async hasShallowInstalledPackage(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    const packageRoot = await this.getPackageDirPath(packageObject);
+    if (!await fs.exists(packageRoot)) {
+      return false;
+    }
+
+    const packageDir = path.join(packageRoot, 'package');
+    if (!await fs.exists(packageDir)) {
+      return false;
+    }
+
+    const manifestPath = path.join(packageDir, 'package.json');
+    if (!await fs.exists(manifestPath)) {
+      return false;
+    }
+
+    const indexPath = path.join(packageDir, '.fpi.index.json');
+    if (await fs.exists(indexPath)) {
+      return await this.isStrictlyMaterialized(packageObject);
+    }
+
+    const legacyIndexPath = path.join(packageDir, '.index.json');
+    if (await fs.exists(legacyIndexPath)) {
+      return (await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir)) !== null;
+    }
+
+    return true;
+  }
+
+  private async isStrictlyMaterialized(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    const materialization = await this.getPackageMaterializationStatus(packageObject);
+    return materialization.complete;
+  }
+
+  private async hasReadableManifest(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    try {
+      await this.getManifest(packageObject);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async collectMissingPackages(root: FhirPackageIdentifier): Promise<string[]> {
     const missing: string[] = [];
     const visited = new Set<string>();
+    const { explicitImplicitVersions } = await this.collectExplicitDependencyClosure(root);
 
     const visit = async (pkg: FhirPackageIdentifier) => {
       const key = `${pkg.id}#${pkg.version}`;
@@ -1064,7 +1499,7 @@ export class FhirPackageInstaller {
         return;
       }
 
-      const deps = await this.getDependencies(pkg);
+      const deps = await this.getDependencies(pkg, { explicitImplicitVersions });
       for (const [depId, depVersion] of Object.entries(deps || {})) {
         if (this.skipExamples && depId.includes('examples')) continue;
         await visit({ id: depId, version: depVersion });
@@ -1073,6 +1508,54 @@ export class FhirPackageInstaller {
 
     await visit(root);
     return missing;
+  }
+
+  private async collectPlannedDependencyClosure(
+    root: FhirPackageIdentifier,
+    seedExplicitImplicitVersions?: ReadonlyMap<string, string>
+  ): Promise<Map<string, FhirPackageIdentifier>> {
+    return await this.withDebugTiming(
+      `collect-planned-dependency-closure ${this.formatPackageForDebug(root)}`,
+      async () => {
+        const { closure, explicitImplicitVersions: localExplicitImplicitVersions } = await this.collectExplicitDependencyClosure(root);
+        const explicitImplicitVersions = new Map(seedExplicitImplicitVersions ?? []);
+        for (const [packageId, version] of localExplicitImplicitVersions.entries()) {
+          if (!explicitImplicitVersions.has(packageId)) {
+            explicitImplicitVersions.set(packageId, version);
+          }
+        }
+        const expanded = new Set<string>();
+        const queue: FhirPackageIdentifier[] = [root, ...Array.from(closure.values())];
+
+        while (queue.length > 0) {
+          const current = queue.shift() as FhirPackageIdentifier;
+          const currentKey = this.getPackageKey(current);
+          if (expanded.has(currentKey)) {
+            continue;
+          }
+          expanded.add(currentKey);
+
+          const dependencies = await this.getDependenciesForPlanning(current, explicitImplicitVersions);
+          for (const [depId, depVersion] of Object.entries(dependencies)) {
+            if (this.skipExamples && depId.includes('examples')) {
+              continue;
+            }
+
+            const dependency = { id: depId, version: depVersion };
+            const dependencyKey = this.getPackageKey(dependency);
+            if (!closure.has(dependencyKey)) {
+              closure.set(dependencyKey, dependency);
+            }
+            if (!expanded.has(dependencyKey)) {
+              queue.push(dependency);
+            }
+          }
+        }
+
+        return closure;
+      },
+      (closure) => `plannedPackages=${closure.size}`
+    );
   }
 
   private async withRetries<T>(
@@ -1143,9 +1626,15 @@ export class FhirPackageInstaller {
    */
   private async generatePackageIndex(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
     const pckIdObj = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
-    this.logger.debug?.(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
-    const packagePath = await this.getPackageDirPath(pckIdObj);
-    return await this.materializePackageIndex(pckIdObj, path.join(packagePath, 'package'));
+    return await this.withDebugTiming(
+      `generate-package-index ${this.formatPackageForDebug(pckIdObj)}`,
+      async () => {
+        this.logger.debug?.(`Generating new .fpi.index.json file for package ${pckIdObj.id}@${pckIdObj.version}...`);
+        const packagePath = await this.getPackageDirPath(pckIdObj);
+        return await this.materializePackageIndex(pckIdObj, path.join(packagePath, 'package'));
+      },
+      (indexJson) => `fileCount=${indexJson.files.length}`
+    );
   }
 
   /**
@@ -1481,10 +1970,17 @@ export class FhirPackageInstaller {
    * @param src The source tarball, either a file path or a Readable stream.
    * @returns The path to the temporary directory where the package was extracted.
    */
-  private async extractTarball(src: string | Readable, options?: { packageObject?: FhirPackageIdentifier }): Promise<string> {
+  private async extractTarball(
+    src: string | Readable,
+    options?: { packageObject?: FhirPackageIdentifier; packageLabel?: string }
+  ): Promise<string> {
     const tarballStream: Readable = typeof src === 'string' ? fs.createReadStream(src) : src;
 
     const pkgObj = options?.packageObject;
+    const packageLabel = pkgObj
+      ? this.formatPackageForDebug(pkgObj)
+      : options?.packageLabel?.trim() || 'unknown package';
+    const extractionStartedAtNs = process.hrtime.bigint();
     let cachedIndex: PackageIndex | null = null;
     if (pkgObj?.id && pkgObj?.version) {
       try {
@@ -1507,8 +2003,8 @@ export class FhirPackageInstaller {
     const indexEntries: FileInPackageIndex[] = [];
     const handleEntryPromises: Promise<void>[] = [];
 
-    const tempDirectory = createTempDir();
-    this.logger.debug?.(`Extracting package to ${tempDirectory}`);
+    const tempDirectory = await this.createWorkingTempDir({ preferCache: Boolean(pkgObj) });
+    this.logger.debug?.(`Extracting package ${packageLabel} to ${tempDirectory}`);
     const extract = tar.extract();
 
     // Inactivity timeout: reset whenever we see extraction progress (data or entry completion).
@@ -1552,7 +2048,7 @@ export class FhirPackageInstaller {
     let completedEntries = 0;
     const progressLogIntervalMs = 30000;
     const progressLogHandle = setInterval(() => {
-      this.logger.debug?.(`Extracting package... completed ${completedEntries} entries so far`);
+      this.logger.debug?.(`Extracting package ${packageLabel}... completed ${completedEntries} entries so far`);
     }, progressLogIntervalMs);
     // Don't keep the process alive only for progress logging
     (progressLogHandle as any).unref?.();
@@ -1659,13 +2155,30 @@ export class FhirPackageInstaller {
     });
 
     const extractionPromise = (async () => {
+      const archiveExtractionStartedAtNs = process.hrtime.bigint();
       await pipeline(
         tarballStream,
         zlib.createGunzip(),
         extract
       );
+      this.logger.debug?.(
+        `[extract] Finished unpacking archive for ${packageLabel} into ${tempDirectory} ` +
+        `in ${this.formatElapsedMs(archiveExtractionStartedAtNs)}ms (entries=${completedEntries}).`
+      );
 
+      const indexBuildStartedAtNs = process.hrtime.bigint();
       await Promise.all(handleEntryPromises);
+      if (shouldParseForIndex) {
+        this.logger.debug?.(
+          `[extract] Built in-memory index candidates for ${packageLabel} ` +
+          `in ${this.formatElapsedMs(indexBuildStartedAtNs)}ms (fileCount=${indexEntries.length}).`
+        );
+      } else {
+        this.logger.debug?.(
+          `[extract] Reused cached index for ${packageLabel} ` +
+          `in ${this.formatElapsedMs(indexBuildStartedAtNs)}ms (fileCount=${cachedIndex?.files.length ?? 0}).`
+        );
+      }
     })();
 
     const inactivityTimeoutPromise = new Promise<void>((_, reject) => {
@@ -1687,47 +2200,65 @@ export class FhirPackageInstaller {
       'index-version': 2,
       files: shouldParseForIndex ? indexEntries : (cachedIndex?.files || [])
     };
+    const extractedIndexWriteStartedAtNs = process.hrtime.bigint();
     await fs.writeJSON(path.join(tempDirectory, 'package', '.fpi.index.json'), indexJson);
+    this.logger.debug?.(
+      `[extract] Wrote extracted package index for ${packageLabel} ` +
+      `in ${this.formatElapsedMs(extractedIndexWriteStartedAtNs)}ms (fileCount=${indexJson.files.length}).`
+    );
 
     // If we computed an index for a known package version, persist to memory + per-cachePath disk (best-effort)
     if (shouldParseForIndex && pkgObj?.id && pkgObj?.version) {
+      const extractedIndexCachePersistStartedAtNs = process.hrtime.bigint();
       try {
         const memKey = this.getIndexMemKey(pkgObj);
         memSetNoTtl(memKey, indexJson);
         const diskPath = this.getDiskIndexCachePath(pkgObj);
         await this.ensureDiskCacheSubdir('indexes');
         await this.writeDiskCacheJsonNoTtl(diskPath, indexJson);
+        this.logger.debug?.(
+          `[extract] Persisted extracted index cache for ${packageLabel} ` +
+          `in ${this.formatElapsedMs(extractedIndexCachePersistStartedAtNs)}ms.`
+        );
       } catch {
         // ignore
       }
     }
   
-    this.logger.debug?.('Extracted to a temporary directory');
+    this.logger.debug?.(
+      `Extracted ${packageLabel} to temporary directory ${tempDirectory} ` +
+      `in ${this.formatElapsedMs(extractionStartedAtNs)}ms.`
+    );
     return tempDirectory;
   }
 
   private async downloadAndExtractTarball(packageObject: FhirPackageIdentifier): Promise<string> {
-    const cachedTgzPath = await this.getOrDownloadDiskCachedTarball(packageObject);
-    try {
-      return await this.extractTarball(cachedTgzPath, { packageObject });
-    } catch (e: any) {
-      if (e instanceof FhirPackageInstallError) throw e;
-      let tarballUrl: string | undefined;
-      try {
-        tarballUrl = await this.getTarballUrl(packageObject);
-      } catch {
-        tarballUrl = undefined;
+    return await this.withDebugTiming(
+      `download-and-extract-tarball ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        const cachedTgzPath = await this.getOrDownloadDiskCachedTarball(packageObject);
+        try {
+          return await this.extractTarball(cachedTgzPath, { packageObject });
+        } catch (e: any) {
+          if (e instanceof FhirPackageInstallError) throw e;
+          let tarballUrl: string | undefined;
+          try {
+            tarballUrl = await this.getTarballUrl(packageObject);
+          } catch {
+            tarballUrl = undefined;
+          }
+          throw new FhirPackageInstallError({
+            packageId: packageObject.id,
+            version: packageObject.version ?? 'unknown',
+            registryUrl: this.registryUrl,
+            cachePath: this.cachePath,
+            step: 'extract-tarball',
+            tarballUrl,
+            cause: e,
+          });
+        }
       }
-      throw new FhirPackageInstallError({
-        packageId: packageObject.id,
-        version: packageObject.version ?? 'unknown',
-        registryUrl: this.registryUrl,
-        cachePath: this.cachePath,
-        step: 'extract-tarball',
-        tarballUrl,
-        cause: e,
-      });
-    }
+    );
   }
 
   /**
@@ -1739,52 +2270,57 @@ export class FhirPackageInstaller {
    * @returns The path to the cached package directory
    */
   private async cachePackage(packageObject: FhirPackageIdentifier, src: string, move: boolean = true): Promise<string> {
-    const finalPath = await this.getPackageDirPath(packageObject);
-    const isInstalled = await this.isInstalled(packageObject, { deep: false });
-    if (isInstalled) {
-      return finalPath;
-    }
+    return await this.withDebugTiming(
+      `cache-package ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        const finalPath = await this.getPackageDirPath(packageObject);
+        const isInstalled = await this.isStrictlyMaterialized(packageObject);
+        if (isInstalled) {
+          return finalPath;
+        }
 
-    const stagingPath = await this.stagePackageForPublish(packageObject, src, move);
+        const stagingPath = await this.stagePackageForPublish(packageObject, src, move);
 
-    try {
-      const existingState = await this.getPackageMaterializationStatus(packageObject);
-      if (!existingState.complete && await fs.exists(finalPath)) {
-        await fs.remove(finalPath);
-      }
-
-      try {
-        await fs.move(stagingPath, finalPath, { overwrite: false });
-      } catch (e: any) {
-        if (e?.code === 'EEXIST') {
-          const stateAfterCollision = await this.getPackageMaterializationStatus(packageObject);
-          if (stateAfterCollision.complete) {
-            this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
-            return finalPath;
+        try {
+          const existingState = await this.getPackageMaterializationStatus(packageObject);
+          if (!existingState.complete && await fs.exists(finalPath)) {
+            await fs.remove(finalPath);
           }
 
-          await fs.remove(finalPath).catch(() => undefined);
-          await fs.move(stagingPath, finalPath, { overwrite: false });
-        } else {
-          throw e;
+          try {
+            await fs.move(stagingPath, finalPath, { overwrite: false });
+          } catch (e: any) {
+            if (e?.code === 'EEXIST') {
+              const stateAfterCollision = await this.getPackageMaterializationStatus(packageObject);
+              if (stateAfterCollision.complete) {
+                this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);
+                return finalPath;
+              }
+
+              await fs.remove(finalPath).catch(() => undefined);
+              await fs.move(stagingPath, finalPath, { overwrite: false });
+            } else {
+              throw e;
+            }
+          }
+
+          this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
+          return finalPath;
+        } catch (e: any) {
+          if (e instanceof FhirPackageInstallError) throw e;
+          throw new FhirPackageInstallError({
+            packageId: packageObject.id,
+            version: packageObject.version ?? 'unknown',
+            registryUrl: this.registryUrl,
+            cachePath: this.cachePath,
+            step: 'cache-package',
+            cause: e,
+          });
+        } finally {
+          await fs.remove(stagingPath).catch(() => undefined);
         }
       }
-
-      this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${finalPath}`);
-      return finalPath;
-    } catch (e: any) {
-      if (e instanceof FhirPackageInstallError) throw e;
-      throw new FhirPackageInstallError({
-        packageId: packageObject.id,
-        version: packageObject.version ?? 'unknown',
-        registryUrl: this.registryUrl,
-        cachePath: this.cachePath,
-        step: 'cache-package',
-        cause: e,
-      });
-    } finally {
-      await fs.remove(stagingPath).catch(() => undefined);
-    }
+    );
   }
 
   /**
@@ -1823,8 +2359,8 @@ export class FhirPackageInstaller {
     }
 
     const packageObject = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
-    const materialization = await this.getPackageMaterializationStatus(packageObject);
-    if (!materialization.complete) {
+    const shallowInstalled = await this.hasShallowInstalledPackage(packageObject);
+    if (!shallowInstalled) {
       return false;
     }
     if (!deep) {
@@ -1848,11 +2384,18 @@ export class FhirPackageInstaller {
   }
 
   public async getPackageIndexFile(packageId: FhirPackageIdentifier | string): Promise<PackageIndex> {
-    const indexPath = await this.getPackageIndexPath(packageId);
-    if (await fs.exists(indexPath)) {
-      return await fs.readJSON(indexPath, { encoding: 'utf8' });
-    }
-    return await this.generatePackageIndex(packageId);
+    const packageObject = typeof packageId === 'string' ? await this.toPackageObject(packageId) : packageId;
+    return await this.withDebugTiming(
+      `get-package-index-file ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        const indexPath = await this.getPackageIndexPath(packageObject);
+        if (await fs.exists(indexPath)) {
+          return await fs.readJSON(indexPath, { encoding: 'utf8' });
+        }
+        return await this.generatePackageIndex(packageObject);
+      },
+      (indexJson) => `fileCount=${indexJson.files.length}`
+    );
   }
 
   public async checkLatestPackageDist(packageName: string): Promise<string> {
@@ -1919,6 +2462,13 @@ export class FhirPackageInstaller {
     return `implicit-effective|${this.registryUrl}|${this.cachePath}|${packageId}`;
   }
 
+  private getImplicitPlanningCacheKeys(packageId: string): string[] {
+    return [
+      this.getImplicitEffectiveCacheKey(packageId),
+      this.getImplicitEffectiveCacheKey(`${packageId}|planning`),
+    ];
+  }
+
   private async readManifestFile(packageFolder: string): Promise<PackageManifest> {
     const manifestPath = path.join(packageFolder, 'package.json');
     return await fs.readJSON(manifestPath, { encoding: 'utf8' });
@@ -1937,9 +2487,10 @@ export class FhirPackageInstaller {
       const code = err?.code;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         if (IMPLICIT_PACKAGE_IDS.has(packageObj.id)) {
-          const cacheKey = this.getImplicitEffectiveCacheKey(packageObj.id);
-          const implicitFailure = implicitResolutionFailureCache.get(cacheKey);
-          if (implicitFailure) throw implicitFailure;
+          for (const cacheKey of this.getImplicitPlanningCacheKeys(packageObj.id)) {
+            const implicitFailure = implicitResolutionFailureCache.get(cacheKey);
+            if (implicitFailure) throw implicitFailure;
+          }
         }
 
         const expected = path.join(packageFolder, 'package.json');
@@ -1998,19 +2549,17 @@ export class FhirPackageInstaller {
   /**
    * Resolve an implicit package dependency to an effective version that is installed and manifest-valid.
    *
-   * Candidate selection (online):
-   *  1) dist-tags.latest
-   *  2) next 2 most recent registry versions (semver desc)
-   *
-   * If the registry is disabled/unavailable, fall back to the latest installed, manifest-valid version.
+   * This is the materializing resolver used by code paths that need a real readable package entry,
+   * not just a plannable version candidate.
    */
-  private async resolveImplicitPackageVersionWithFallbacks(packageName: string): Promise<string> {
+  protected async resolveImplicitPackageVersionWithFallbacks(packageName: string): Promise<string> {
     const cacheKey = this.getImplicitEffectiveCacheKey(packageName);
     const cachedFailure = implicitResolutionFailureCache.get(cacheKey);
     if (cachedFailure) throw cachedFailure;
+
     const cached = implicitEffectiveVersionCache.get(cacheKey);
     if (cached) {
-      const ok = await this.packageManifestExists({ id: packageName, version: cached });
+      const ok = await this.hasReadableManifest({ id: packageName, version: cached });
       if (ok) return cached;
       implicitEffectiveVersionCache.delete(cacheKey);
     }
@@ -2018,9 +2567,10 @@ export class FhirPackageInstaller {
     return await withSingleFlight(inFlightImplicitEffectiveVersion, cacheKey, async () => {
       const cachedFailure2 = implicitResolutionFailureCache.get(cacheKey);
       if (cachedFailure2) throw cachedFailure2;
+
       const cached2 = implicitEffectiveVersionCache.get(cacheKey);
       if (cached2) {
-        const ok = await this.packageManifestExists({ id: packageName, version: cached2 });
+        const ok = await this.hasReadableManifest({ id: packageName, version: cached2 });
         if (ok) return cached2;
         implicitEffectiveVersionCache.delete(cacheKey);
       }
@@ -2031,88 +2581,98 @@ export class FhirPackageInstaller {
           const installedVersions = await this.getInstalledVersions(packageName);
           const attempted: string[] = [];
           const causes: string[] = [];
-          for (const v of installedVersions) {
-            attempted.push(v);
+          for (const version of installedVersions) {
+            attempted.push(version);
             try {
-              const ok = await this.isInstalled({ id: packageName, version: v }, { deep: false });
+              const ok = await this.hasReadableManifest({ id: packageName, version });
               if (ok) {
                 implicitResolutionFailureCache.delete(cacheKey);
-                implicitEffectiveVersionCache.set(cacheKey, v, this.registryTtlMs);
-                return v;
+                implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+                return version;
               }
-            } catch (e: any) {
-              causes.push(`${v}: ${e?.message || String(e)}`);
+            } catch (error: any) {
+              causes.push(`${version}: ${error?.message || String(error)}`);
             }
           }
+
           throw new ImplicitPackageResolutionError({
             packageId: packageName,
             attemptedVersions: attempted,
             registryUrl: this.registryUrl,
             cachePath: this.cachePath,
-            causes
+            causes,
           });
         };
 
-        // Registry disabled mode: never attempt downloads.
         if (this.isRegistryDisabled()) {
           return await resolveFromInstalled(
             `Registry disabled; using latest installed version for implicit package ${packageName} (if available)`
           );
         }
 
-        // Online-first candidate gathering (using the existing cached registry metadata).
         let candidates: string[] = [];
         try {
           const packageData = await this.getPackageDataFromRegistry(packageName);
           const latest = packageData['dist-tags']?.latest as string | undefined;
           const versionsObj = (packageData.versions || {}) as Record<string, any>;
           const allVersions = Object.keys(versionsObj)
-            .filter((v) => typeof v === 'string' && semver.valid(v))
+            .filter((version) => typeof version === 'string' && semver.valid(version))
             .sort((a, b) => semver.rcompare(a, b));
 
           const unique: string[] = [];
-          const pushUnique = (v: string | undefined) => {
-            if (!v || typeof v !== 'string') return;
-            if (!unique.includes(v)) unique.push(v);
+          const pushUnique = (version: string | undefined) => {
+            if (!version || typeof version !== 'string') return;
+            if (!unique.includes(version)) unique.push(version);
           };
 
           pushUnique(latest);
-          for (const v of allVersions) {
-            pushUnique(v);
+          for (const version of allVersions) {
+            pushUnique(version);
             if (unique.length >= 3) break;
           }
           candidates = unique;
-        } catch (e: any) {
-          // Registry unavailable: use latest installed that is manifest-valid.
+        } catch (error: any) {
           return await resolveFromInstalled(
-            `Failed to fetch registry metadata for implicit package ${packageName}: ${e?.message || String(e)}. ` +
+            `Failed to fetch registry metadata for implicit package ${packageName}: ${error?.message || String(error)}. ` +
             'Falling back to latest installed version (if available).'
           );
         }
 
         const attemptedVersions: string[] = [];
         const causes: string[] = [];
+
         for (const version of candidates) {
           attemptedVersions.push(version);
-          const pkgObj = { id: packageName, version };
+          const packageObject = { id: packageName, version };
+
           try {
-            const alreadyOk = await this.isInstalled(pkgObj, { deep: false });
+            const alreadyOk = await this.hasReadableManifest(packageObject);
             if (alreadyOk) {
               implicitResolutionFailureCache.delete(cacheKey);
               implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
               return version;
             }
 
-            await this.install(pkgObj);
-            const okAfterInstall = await this.isInstalled(pkgObj, { deep: false });
+            await this.install(packageObject);
+            const okAfterInstall = await this.isStrictlyMaterialized(packageObject);
             if (okAfterInstall) {
               implicitResolutionFailureCache.delete(cacheKey);
               implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
               return version;
             }
             causes.push(`${version}: install completed but manifest missing`);
-          } catch (e: any) {
-            causes.push(`${version}: ${e?.message || String(e)}`);
+          } catch (error: any) {
+            try {
+              const materializedAfterFailure = await this.isStrictlyMaterialized(packageObject);
+              if (materializedAfterFailure) {
+                implicitResolutionFailureCache.delete(cacheKey);
+                implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+                return version;
+              }
+            } catch {
+              // Fall through and record the original failure.
+            }
+            causes.push(`${version}: ${error?.message || String(error)}`);
           }
         }
 
@@ -2121,14 +2681,148 @@ export class FhirPackageInstaller {
           attemptedVersions,
           registryUrl: this.registryUrl,
           cachePath: this.cachePath,
-          causes
+          causes,
         });
-      } catch (e: any) {
-        if (e instanceof ImplicitPackageResolutionError) {
-          implicitResolutionFailureCache.set(cacheKey, e, this.registryTtlMs);
+      } catch (error: any) {
+        if (error instanceof ImplicitPackageResolutionError) {
+          implicitResolutionFailureCache.set(cacheKey, error, this.registryTtlMs);
         }
-        throw e;
+        throw error;
       }
+    });
+  }
+
+  private async resolveImplicitPackageVersionForPlanning(packageName: string): Promise<string> {
+    const cacheKey = this.getImplicitEffectiveCacheKey(`${packageName}|planning`);
+    const cachedFailure = implicitResolutionFailureCache.get(cacheKey);
+    if (cachedFailure) throw cachedFailure;
+
+    const hasUsablePlanningVersion = async (version: string): Promise<boolean> => {
+      const packageObject = { id: packageName, version };
+      if (await this.hasReadableManifest(packageObject)) {
+        return true;
+      }
+      if (this.isRegistryDisabled()) {
+        return false;
+      }
+      try {
+        await this.getOrDownloadDiskCachedTarball(packageObject);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const cached = implicitEffectiveVersionCache.get(cacheKey);
+    if (cached) {
+      if (await hasUsablePlanningVersion(cached)) {
+        return cached;
+      }
+      implicitEffectiveVersionCache.delete(cacheKey);
+    }
+
+    return await withSingleFlight(inFlightImplicitEffectiveVersion, cacheKey, async () => {
+      const cachedFailure2 = implicitResolutionFailureCache.get(cacheKey);
+      if (cachedFailure2) throw cachedFailure2;
+
+      const cached2 = implicitEffectiveVersionCache.get(cacheKey);
+      if (cached2) {
+        if (await hasUsablePlanningVersion(cached2)) {
+          return cached2;
+        }
+        implicitEffectiveVersionCache.delete(cacheKey);
+      }
+
+      const resolveFromInstalled = async (detail: string): Promise<string> => {
+        this.logger.warn?.(detail);
+        const installedVersions = await this.getInstalledVersions(packageName);
+        if (installedVersions.length > 0) {
+          const version = installedVersions[0];
+          implicitResolutionFailureCache.delete(cacheKey);
+          implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+          return version;
+        }
+
+        const failure = new ImplicitPackageResolutionError({
+          packageId: packageName,
+          attemptedVersions: [],
+          registryUrl: this.registryUrl,
+          cachePath: this.cachePath,
+          causes: ['No installed versions available for planning fallback.']
+        });
+        implicitResolutionFailureCache.set(this.getImplicitEffectiveCacheKey(packageName), failure, this.registryTtlMs);
+        implicitResolutionFailureCache.set(cacheKey, failure, this.registryTtlMs);
+        throw failure;
+      };
+
+      if (this.isRegistryDisabled()) {
+        return await resolveFromInstalled(
+          `Registry disabled; using latest installed version for implicit package ${packageName} during dependency planning (if available)`
+        );
+      }
+
+      let candidates: string[] = [];
+      try {
+        const packageData = await this.getPackageDataFromRegistry(packageName);
+        const latest = packageData['dist-tags']?.latest as string | undefined;
+        const versionsObj = (packageData.versions || {}) as Record<string, any>;
+        const allVersions = Object.keys(versionsObj)
+          .filter((v) => typeof v === 'string' && semver.valid(v))
+          .sort((a, b) => semver.rcompare(a, b));
+
+        const unique: string[] = [];
+        const pushUnique = (v: string | undefined) => {
+          if (!v || typeof v !== 'string') return;
+          if (!unique.includes(v)) unique.push(v);
+        };
+
+        pushUnique(latest);
+        for (const v of allVersions) {
+          pushUnique(v);
+          if (unique.length >= 3) break;
+        }
+        candidates = unique;
+      } catch (e: any) {
+        return await resolveFromInstalled(
+          `Failed to fetch registry metadata for implicit package ${packageName} during dependency planning: ${e?.message || String(e)}. ` +
+          'Falling back to latest installed version (if available).'
+        );
+      }
+
+      const attemptedVersions: string[] = [];
+      const causes: string[] = [];
+
+      for (const version of candidates) {
+        attemptedVersions.push(version);
+        const pkgObj = { id: packageName, version };
+
+        try {
+          const alreadyOk = await this.hasReadableManifest(pkgObj);
+          if (alreadyOk) {
+            implicitResolutionFailureCache.delete(cacheKey);
+            implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+            return version;
+          }
+
+          await this.getOrDownloadDiskCachedTarball(pkgObj);
+          implicitResolutionFailureCache.delete(cacheKey);
+          implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+          return version;
+        } catch (e: any) {
+          causes.push(`${version}: ${e?.message || String(e)}`);
+        }
+      }
+
+      const failure = new ImplicitPackageResolutionError({
+        packageId: packageName,
+        attemptedVersions,
+        registryUrl: this.registryUrl,
+        cachePath: this.cachePath,
+        causes,
+      });
+      implicitResolutionFailureCache.set(this.getImplicitEffectiveCacheKey(packageName), failure, this.registryTtlMs);
+      implicitResolutionFailureCache.set(cacheKey, failure, this.registryTtlMs);
+      throw failure;
     });
   }
 
@@ -2137,7 +2831,10 @@ export class FhirPackageInstaller {
    * @param packageObject The package to check for implicit dependencies
    * @returns Promise resolving to record of implicit dependencies
    */
-  private async getImplicitDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
+  private async getImplicitDependencies(
+    packageObject: FhirPackageIdentifier,
+    explicitImplicitVersions?: ReadonlyMap<string, string>
+  ): Promise<Record<string, string>> {
     const implicitDeps: Record<string, string> = {};
     
     // Prevent recursion - if we're already resolving implicit deps for this package, return empty
@@ -2156,11 +2853,13 @@ export class FhirPackageInstaller {
     this.resolvingImplicitDeps.add(packageKey);
     
     try {
-      // Resolve versions for each implicit dependency.
-      // If any implicit package can't be resolved (and isn't installed), we must fail startup.
+      // Resolve versions for each implicit dependency without side-effectful installs.
+      // When the surrounding graph already selected explicit versions for implicit packages,
+      // those pins win over the implicit latest-version fallback.
       for (const implicitPackageId of implicitPackageIds) {
-        const version = await this.resolveImplicitPackageVersionWithFallbacks(implicitPackageId);
-        implicitDeps[implicitPackageId] = version;
+        const explicitVersion = explicitImplicitVersions?.get(implicitPackageId);
+        implicitDeps[implicitPackageId] = explicitVersion
+          ?? await this.resolveImplicitPackageVersionForPlanning(implicitPackageId);
       }
     } finally {
       // Always remove from tracking set
@@ -2177,11 +2876,163 @@ export class FhirPackageInstaller {
    */
   private async getExplicitDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
     const deps = (await this.getManifest(packageObject))?.dependencies || {};
-    // special case: some packages refer to hl7.fhir.r4.core as version 4.0.0 instead of 4.0.1
-    if (deps && deps['hl7.fhir.r4.core'] === '4.0.0') {
-      deps['hl7.fhir.r4.core'] = '4.0.1';
+    return this.normalizeDependencies(deps);
+  }
+
+  private async getExplicitDependenciesFromTarballManifest(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
+    if (this.isRegistryDisabled()) {
+      return {};
     }
-    return deps;
+
+    try {
+      const tgzPath = await this.getOrDownloadDiskCachedTarball(packageObject);
+      const extract = tar.extract();
+      let manifest: PackageManifest | null = null;
+
+      extract.on('entry', (header, stream, next) => {
+        const entryName = header.name.replace(/\\/g, '/');
+        const isManifest = entryName === 'package/package.json' || entryName === 'package.json';
+        if (!isManifest || manifest) {
+          stream.on('end', next);
+          stream.resume();
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        stream.on('data', (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        stream.on('end', () => {
+          try {
+            manifest = JSON.parse(Buffer.concat(chunks).toString('utf8')) as PackageManifest;
+            next();
+          } catch (error) {
+            extract.destroy(error as Error);
+          }
+        });
+        stream.resume();
+      });
+
+      await pipeline(fs.createReadStream(tgzPath), zlib.createGunzip(), extract);
+
+      const deps = (manifest as PackageManifest | null)?.dependencies;
+      if (!deps || typeof deps !== 'object') {
+        return {};
+      }
+
+      return this.normalizeDependencies(deps as Record<string, string>);
+    } catch (error) {
+      this.logger.debug?.(
+        `Failed to plan explicit dependencies for ${this.formatPackageForDebug(packageObject)} from tarball manifest: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return {};
+    }
+  }
+
+  private async getExplicitDependenciesFromRegistryMetadata(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
+    if (this.isRegistryDisabled()) {
+      return {};
+    }
+
+    const version = packageObject.version;
+    if (!version) {
+      return {};
+    }
+
+    try {
+      const packageData = await this.getPackageDataFromRegistry(packageObject.id);
+      const versionData = packageData?.versions?.[version];
+      const rawDeps = versionData?.dependencies;
+      if (!rawDeps || typeof rawDeps !== 'object') {
+        return {};
+      }
+
+      const deps = Object.fromEntries(
+        Object.entries(rawDeps).filter(([, version]) => typeof version === 'string')
+      ) as Record<string, string>;
+      return this.normalizeDependencies(deps);
+    } catch (error) {
+      this.logger.debug?.(
+        `Failed to plan explicit dependencies for ${this.formatPackageForDebug(packageObject)} from registry metadata: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return {};
+    }
+  }
+
+  private async getExplicitDependenciesForPlanning(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
+    const hasManifest = await this.hasReadableManifest(packageObject).catch(() => false);
+    if (hasManifest) {
+      return await this.getExplicitDependencies(packageObject);
+    }
+
+    const registryDeps = await this.getExplicitDependenciesFromRegistryMetadata(packageObject);
+    if (Object.keys(registryDeps).length > 0) {
+      return registryDeps;
+    }
+
+    return await this.getExplicitDependenciesFromTarballManifest(packageObject);
+  }
+
+  private async getDependenciesForPlanning(
+    packageObject: FhirPackageIdentifier,
+    explicitImplicitVersions?: ReadonlyMap<string, string>
+  ): Promise<Record<string, string>> {
+    return await this.getDependencies(packageObject, {
+      explicitImplicitVersions,
+      includePlanningFallbacks: true,
+    });
+  }
+
+  private async collectExplicitDependencyClosure(root: FhirPackageIdentifier): Promise<{
+    closure: Map<string, FhirPackageIdentifier>;
+    explicitImplicitVersions: Map<string, string>;
+  }> {
+    const closure = new Map<string, FhirPackageIdentifier>();
+    const explicitImplicitVersions = new Map<string, string>();
+    const expanded = new Set<string>();
+    const queue: FhirPackageIdentifier[] = [root];
+
+    if (IMPLICIT_PACKAGE_IDS.has(root.id) && root.version) {
+      explicitImplicitVersions.set(root.id, root.version);
+    }
+
+    while (queue.length > 0) {
+      const current = queue.shift() as FhirPackageIdentifier;
+      const currentKey = this.getPackageKey(current);
+      if (expanded.has(currentKey)) {
+        continue;
+      }
+      expanded.add(currentKey);
+
+      const explicitDeps = await this.getExplicitDependenciesForPlanning(current);
+
+      for (const [depId, rawDepVersion] of Object.entries(explicitDeps)) {
+        if (this.skipExamples && depId.includes('examples')) {
+          continue;
+        }
+
+        let depVersion = rawDepVersion;
+        if (IMPLICIT_PACKAGE_IDS.has(depId)) {
+          const selectedVersion = explicitImplicitVersions.get(depId);
+          if (selectedVersion) {
+            depVersion = selectedVersion;
+          } else {
+            explicitImplicitVersions.set(depId, depVersion);
+          }
+        }
+
+        const dependency = { id: depId, version: depVersion };
+        const dependencyKey = this.getPackageKey(dependency);
+        if (!closure.has(dependencyKey)) {
+          closure.set(dependencyKey, dependency);
+        }
+        if (!expanded.has(dependencyKey)) {
+          queue.push(dependency);
+        }
+      }
+    }
+
+    return { closure, explicitImplicitVersions };
   }
 
   /**
@@ -2192,17 +3043,39 @@ export class FhirPackageInstaller {
    * this automatically includes essential terminology and extension packages.
    * 
    * @param packageObject The package to get dependencies for
+   * @param options Optional root/context information for graph-aware implicit package version selection
    * @returns Promise resolving to record of all dependencies (explicit + implicit)
    */
-  public async getDependencies(packageObject: FhirPackageIdentifier): Promise<Record<string, string>> {
-    // Get explicit dependencies from package.json
-    const explicitDeps = await this.getExplicitDependencies(packageObject);
-    
-    // Get implicit dependencies if this is a core package  
-    const implicitDeps = await this.getImplicitDependencies(packageObject);
-    
-    // Merge dependencies, with explicit taking precedence over implicit
-    return { ...implicitDeps, ...explicitDeps };
+  public async getDependencies(
+    packageObject: FhirPackageIdentifier,
+    options?: GetDependenciesOptions
+  ): Promise<Record<string, string>> {
+    const includePlanningFallbacks = options?.includePlanningFallbacks
+      ?? Boolean(options?.rootPackage);
+
+    let explicitImplicitVersions = options?.explicitImplicitVersions;
+    if (!explicitImplicitVersions && options?.rootPackage) {
+      const rootPackage = typeof options.rootPackage === 'string'
+        ? await this.toPackageObject(options.rootPackage)
+        : options.rootPackage;
+      const context = await this.collectExplicitDependencyClosure(rootPackage);
+      explicitImplicitVersions = context.explicitImplicitVersions;
+    }
+
+    const explicitDeps = includePlanningFallbacks
+      ? await this.getExplicitDependenciesForPlanning(packageObject)
+      : await this.getExplicitDependencies(packageObject);
+
+    const normalizedExplicitDeps = Object.fromEntries(
+      Object.entries(explicitDeps).map(([depId, depVersion]) => {
+        const selectedVersion = explicitImplicitVersions?.get(depId);
+        return [depId, selectedVersion ?? depVersion];
+      })
+    ) as Record<string, string>;
+
+    const implicitDeps = await this.getImplicitDependencies(packageObject, explicitImplicitVersions);
+
+    return { ...implicitDeps, ...normalizedExplicitDeps };
   }
 
   public async install(packageId: string | FhirPackageIdentifier): Promise<boolean> {
@@ -2237,59 +3110,142 @@ export class FhirPackageInstaller {
       return true;
     }
 
-    const runInstall = async (): Promise<boolean> => {
-      // Only check that *this package* is present/complete.
-      // Transitive dependency installation is handled by installPackageDependencies().
-      const installedShallow = await this.isInstalled(packageObject, { deep: false });
-      if (!installedShallow) {
+    return await this.withDebugTiming(
+      `install ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        await this.withPackageInstallLock(packageObject, async () => {
+          await this.materializePackageWithoutDependencies(packageObject);
+          return true;
+        });
+
+        this.installingPackages.add(packageKey);
+        try {
+          await this.installPackageDependencies(packageObject);
+          return true;
+        } finally {
+          this.installingPackages.delete(packageKey);
+        }
+      }
+    );
+  }
+
+  private async materializePackageWithoutDependencies(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    return await this.withDebugTiming(
+      `materialize-package-without-dependencies ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        const installedShallow = await this.isStrictlyMaterialized(packageObject);
+        if (installedShallow) {
+          this.logger.debug?.(
+            `Package ${this.formatPackageForDebug(packageObject)} was materialized while waiting for the package install lock; skipping download and using the shared cache entry.`
+          );
+          return false;
+        }
+
         const dirPath = await this.getPackageDirPath(packageObject);
         if (await fs.exists(dirPath)) {
-          // Clean up partial/corrupt installs so we can reinstall cleanly.
           await fs.remove(dirPath);
         }
+
         const tempPath = await this.downloadAndExtractTarball(packageObject);
         await this.cachePackage(packageObject, tempPath);
-      }
-
-      // Mark as installing before dependency installation
-      this.installingPackages.add(packageKey);
-      try {
-        await this.installPackageDependencies(packageObject);
         return true;
-      } finally {
-        // Always remove from installing set
-        this.installingPackages.delete(packageKey);
-      }
-    };
-
-    return await this.withPackageInstallLock(packageObject, runInstall);
+      },
+      (downloaded) => `downloaded=${downloaded}`
+    );
   }
 
   private async installPackageDependencies(packageObject: FhirPackageIdentifier): Promise<void>{
-    try {
-      await this.getPackageIndexFile(packageObject);
-    } catch (e: any) {
-      if (e instanceof FhirPackageInstallError) throw e;
-      throw new FhirPackageInstallError({
-        packageId: packageObject.id,
-        version: packageObject.version ?? 'unknown',
-        registryUrl: this.registryUrl,
-        cachePath: this.cachePath,
-        step: 'generate-index',
-        cause: e,
-      });
-    }
-    
-    // Get all dependencies (explicit + implicit) using the updated getDependencies method
-    const allDeps = await this.getDependencies(packageObject);
-    
-    for (const dep in allDeps) {
-      if (this.skipExamples && dep.includes('examples')) {
-        continue;
-      } else {
-        await this.install(`${dep}@${allDeps[dep]}`);
+    await this.withDebugTiming(
+      `install-package-dependencies ${this.formatPackageForDebug(packageObject)}`,
+      async () => {
+        try {
+          await this.getPackageIndexFile(packageObject);
+        } catch (e: any) {
+          if (e instanceof FhirPackageInstallError) throw e;
+          throw new FhirPackageInstallError({
+            packageId: packageObject.id,
+            version: packageObject.version ?? 'unknown',
+            registryUrl: this.registryUrl,
+            cachePath: this.cachePath,
+            step: 'generate-index',
+            cause: e,
+          });
+        }
+
+        const { explicitImplicitVersions } = await this.collectExplicitDependencyClosure(packageObject);
+        const dependencyQueue = await this.collectPlannedDependencyClosure(packageObject, explicitImplicitVersions);
+        if (dependencyQueue.size === 0) {
+          return;
+        }
+
+        this.logger.debug?.(
+          `Planned dependency closure for ${this.formatPackageForDebug(packageObject)} with ${dependencyQueue.size} package(s).`
+        );
+
+        const completedLocally = new Set<string>();
+        const claimedElsewhere = new Set<string>();
+        let lastWaitLogAt = 0;
+
+        while (true) {
+          const pending: FhirPackageIdentifier[] = [];
+
+          for (const [dependencyKey, dependency] of dependencyQueue) {
+            const installed = completedLocally.has(dependencyKey)
+              || (claimedElsewhere.has(dependencyKey) && await this.isStrictlyMaterialized(dependency));
+            if (installed) {
+              continue;
+            }
+
+            pending.push(dependency);
+          }
+
+          if (pending.length === 0) {
+            return;
+          }
+
+          let claimedWork = false;
+          for (const dependency of pending) {
+            const dependencyKey = this.getPackageKey(dependency);
+            const claim = await this.tryWithPackageInstallLock(dependency, async () => {
+              await this.materializePackageWithoutDependencies(dependency);
+              return true;
+            });
+
+            if (!claim.acquired) {
+              claimedElsewhere.add(dependencyKey);
+              continue;
+            }
+
+            claimedElsewhere.delete(dependencyKey);
+            completedLocally.add(dependencyKey);
+            this.logger.debug?.(
+              `Claimed dependency work item ${this.formatPackageForDebug(dependency)} while installing ${this.formatPackageForDebug(packageObject)}.`
+            );
+            claimedWork = true;
+            break;
+          }
+
+          if (claimedWork) {
+            if (pending.length > 1) {
+              await new Promise((resolve) => setTimeout(resolve, DEPENDENCY_POST_CLAIM_YIELD_MS));
+            }
+            continue;
+          }
+
+          const now = Date.now();
+          if (now - lastWaitLogAt >= DEPENDENCY_WAIT_LOG_INTERVAL_MS) {
+            const preview = pending.slice(0, 5).map((dependency) => this.formatPackageForDebug(dependency)).join(', ');
+            const suffix = pending.length > 5 ? `, ... (${pending.length - 5} more)` : '';
+            this.logger.debug?.(
+              `No immediately claimable dependency work items for ${this.formatPackageForDebug(packageObject)}; waiting ${DEPENDENCY_CLAIM_WAIT_MS}ms before retrying. Pending: ${preview}${suffix}`
+            );
+            lastWaitLogAt = now;
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, DEPENDENCY_CLAIM_WAIT_MS));
+        }
       }
-    }
+    );
   }
 
   /**
@@ -2318,7 +3274,7 @@ export class FhirPackageInstaller {
       finalPath = fullPath;
     } else {
       this.logger.info(`Installing package from file: ${fullPath}`);
-      finalPath = await this.extractTarball(fullPath);
+      finalPath = await this.extractTarball(fullPath, { packageLabel: path.basename(fullPath) });
     }
   
     let packageObject: FhirPackageIdentifier;
