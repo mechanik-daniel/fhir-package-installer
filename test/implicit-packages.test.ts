@@ -16,6 +16,7 @@ const TIMEOUT = 240000; // 240 seconds timeout for installation
 
 describe('Implicit Packages Feature', () => {
   const customCachePath = path.join(path.resolve('.'), 'test', '.test-cache-implicit');
+  const planningCachePath = path.join(path.resolve('.'), 'test', '.test-cache-implicit-planning');
 
   const registryPackages = {
     'hl7.fhir.r4.core': {
@@ -28,7 +29,12 @@ describe('Implicit Packages Feature', () => {
     },
     'hl7.fhir.uv.sdc': {
       latest: '3.0.0',
-      versions: { '3.0.0': { tgz: Buffer.alloc(0) as any } },
+      versions: {
+        '3.0.0': {
+          tgz: Buffer.alloc(0) as any,
+          dependencies: { 'hl7.fhir.r4.core': '4.0.1' },
+        }
+      },
     },
     'hl7.terminology.r4': {
       latest: '3.1.0',
@@ -170,6 +176,30 @@ describe('Implicit Packages Feature', () => {
       expect(deps).not.toHaveProperty('hl7.fhir.uv.extensions.r4');
       
       console.log('Regular package dependencies:', deps);
+    }, TIMEOUT);
+
+    it('should plan implicit dependencies for a transitive core package before those packages are installed', async () => {
+      await fs.remove(planningCachePath);
+
+      const planningFpi = new FhirPackageInstaller({
+        cachePath: planningCachePath,
+        skipExamples: true,
+        allowHttp: true,
+        registryUrl: registry.getBaseUrl(),
+        logger: noopLogger,
+      });
+
+      const closure = await (planningFpi as any).collectPlannedDependencyClosure(regularPackage) as Map<string, { id: string; version: string }>;
+
+      expect(Array.from(closure.keys())).toEqual(expect.arrayContaining([
+        'hl7.fhir.r4.core#4.0.1',
+        'hl7.terminology.r4#3.1.0',
+        'hl7.fhir.uv.extensions.r4#2.0.0',
+      ]));
+
+      expect(await planningFpi.isInstalled({ id: 'hl7.fhir.r4.core', version: '4.0.1' })).toBe(false);
+      expect(await planningFpi.isInstalled({ id: 'hl7.terminology.r4', version: '3.1.0' })).toBe(false);
+      expect(await planningFpi.isInstalled({ id: 'hl7.fhir.uv.extensions.r4', version: '2.0.0' })).toBe(false);
     }, TIMEOUT);
   });
 

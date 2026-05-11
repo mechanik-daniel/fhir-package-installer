@@ -1,9 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { spawn } from 'node:child_process';
+import crypto from 'crypto';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import fs from 'fs-extra';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 
 import { FhirPackageInstaller } from 'fhir-package-installer';
 import type { FileInPackageIndex } from 'fhir-package-installer';
@@ -61,18 +62,29 @@ async function runConcurrentInstallWorkers(args: {
   cachePath: string;
   registryUrl: string;
   workerCount?: number;
+  loggerMode?: 'noop' | 'debug';
 }): Promise<ConcurrentInstallWorkerResult[]> {
   const workerCount = args.workerCount ?? 3;
   const moduleUrl = pathToFileURL(path.resolve('.', 'dist', 'index.mjs')).href;
   const workerCode = `
-const noopLogger = { info: () => {}, warn: () => {}, error: () => {} };
+const makeLogger = () => {
+  if (process.env.SESSION4_LOGGER_MODE !== 'debug') {
+    return { info: () => {}, warn: () => {}, error: () => {} };
+  }
+  return {
+    debug: (message) => console.log('[debug]', message),
+    info: (message) => console.log('[info]', message),
+    warn: () => {},
+    error: () => {},
+  };
+};
 const { FhirPackageInstaller } = await import(process.env.SESSION4_FPI_MODULE_URL);
 const installer = new FhirPackageInstaller({
   cachePath: process.env.SESSION4_CACHE_PATH,
   registryUrl: process.env.SESSION4_REGISTRY_URL,
   allowHttp: true,
   skipExamples: true,
-  logger: noopLogger,
+  logger: makeLogger(),
 });
 const workerId = process.env.SESSION4_WORKER_ID;
 try {
@@ -99,6 +111,7 @@ try {
           SESSION4_REGISTRY_URL: args.registryUrl,
           SESSION4_PACKAGE_ID: args.packageId,
           SESSION4_WORKER_ID: String(workerId),
+          SESSION4_LOGGER_MODE: args.loggerMode ?? 'noop',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -148,6 +161,9 @@ describe('fhir-package-installer module', () => {
   const testPkg = { id: 'test.pkg', version: '1.0.0' };
   const depPkg = { id: 'dep.pkg', version: '1.0.0' };
   const rootPkg = { id: 'root.pkg', version: '1.0.0' };
+  const branchDepAPkg = { id: 'branch.dep.a', version: '1.0.0' };
+  const branchDepBPkg = { id: 'branch.dep.b', version: '1.0.0' };
+  const branchRootPkg = { id: 'branch.root.pkg', version: '1.0.0' };
   const fshGeneratedPkg = { id: 'fsh.test.pkg', version: '0.1.0' };
   const tstPkgHash = `${testPkg.id}#${testPkg.version}`;
   const tstPkgAt = `${testPkg.id}@${testPkg.version}`;
@@ -176,6 +192,37 @@ describe('fhir-package-installer module', () => {
       versions: {
         [rootPkg.version]: {
           tgz: Buffer.alloc(0) as any,
+          dependencies: { [depPkg.id]: depPkg.version },
+        },
+      },
+    },
+    [branchDepAPkg.id]: {
+      latest: branchDepAPkg.version,
+      versions: {
+        [branchDepAPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+          tarballDelayMs: 1500,
+        },
+      },
+    },
+    [branchDepBPkg.id]: {
+      latest: branchDepBPkg.version,
+      versions: {
+        [branchDepBPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+          tarballDelayMs: 1500,
+        },
+      },
+    },
+    [branchRootPkg.id]: {
+      latest: branchRootPkg.version,
+      versions: {
+        [branchRootPkg.version]: {
+          tgz: Buffer.alloc(0) as any,
+          dependencies: {
+            [branchDepAPkg.id]: branchDepAPkg.version,
+            [branchDepBPkg.id]: branchDepBPkg.version,
+          },
         },
       },
     },
@@ -209,11 +256,33 @@ describe('fhir-package-installer module', () => {
       'package/package.json': JSON.stringify({ name: rootPkg.id, version: rootPkg.version, dependencies: { [depPkg.id]: depPkg.version } }),
       'package/StructureDefinition-root.json': JSON.stringify({ resourceType: 'StructureDefinition', id: 'root', url: 'http://example.org/StructureDefinition/root', name: 'Root', version: '1.0.0', kind: 'resource', type: 'Patient' }),
     });
+    const branchDepATgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: branchDepAPkg.id, version: branchDepAPkg.version, dependencies: {} }),
+      'package/StructureDefinition-branch-a.json': JSON.stringify({ resourceType: 'StructureDefinition', id: 'branch-a', url: 'http://example.org/StructureDefinition/branch-a', name: 'BranchA', version: '1.0.0', kind: 'resource', type: 'Patient' }),
+    });
+    const branchDepBTgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: branchDepBPkg.id, version: branchDepBPkg.version, dependencies: {} }),
+      'package/StructureDefinition-branch-b.json': JSON.stringify({ resourceType: 'StructureDefinition', id: 'branch-b', url: 'http://example.org/StructureDefinition/branch-b', name: 'BranchB', version: '1.0.0', kind: 'resource', type: 'Patient' }),
+    });
+    const branchRootTgz = await createTgzBuffer({
+      'package/package.json': JSON.stringify({
+        name: branchRootPkg.id,
+        version: branchRootPkg.version,
+        dependencies: {
+          [branchDepAPkg.id]: branchDepAPkg.version,
+          [branchDepBPkg.id]: branchDepBPkg.version,
+        },
+      }),
+      'package/StructureDefinition-branch-root.json': JSON.stringify({ resourceType: 'StructureDefinition', id: 'branch-root', url: 'http://example.org/StructureDefinition/branch-root', name: 'BranchRoot', version: '1.0.0', kind: 'resource', type: 'Patient' }),
+    });
 
     // Mutate the captured packages object by reference.
     registryPackages[testPkg.id].versions[testPkg.version].tgz = testTgz;
     registryPackages[depPkg.id].versions[depPkg.version].tgz = depTgz;
     registryPackages[rootPkg.id].versions[rootPkg.version].tgz = rootTgz;
+    registryPackages[branchDepAPkg.id].versions[branchDepAPkg.version].tgz = branchDepATgz;
+    registryPackages[branchDepBPkg.id].versions[branchDepBPkg.version].tgz = branchDepBTgz;
+    registryPackages[branchRootPkg.id].versions[branchRootPkg.version].tgz = branchRootTgz;
 
     customCacheFpi = new FhirPackageInstaller({
       cachePath: customCachePath,
@@ -396,6 +465,110 @@ describe('fhir-package-installer module', () => {
     }
   }, TIMEOUT);
 
+  it('should reuse a persisted materialization marker across installer instances after the first strict check', async () => {
+    const materializationCachePath = createTempDir();
+    const packageRoot = path.join(materializationCachePath, `${testPkg.id}#${testPkg.version}`);
+    const packageDir = path.join(packageRoot, 'package');
+    const markerPath = path.join(packageRoot, '.fpi.materialized');
+    const fileCount = 200;
+
+    await fs.ensureDir(packageDir);
+    await fs.writeJSON(path.join(packageDir, 'package.json'), {
+      name: testPkg.id,
+      version: testPkg.version,
+      dependencies: {},
+    });
+
+    const files = Array.from({ length: fileCount }, (_, index) => `ValueSet-${index}.json`);
+    for (const filename of files) {
+      await fs.writeJSON(path.join(packageDir, filename), {
+        resourceType: 'ValueSet',
+        id: filename,
+        url: `http://example.org/${filename}`,
+        name: filename,
+        version: '1.0.0',
+      });
+    }
+
+    await fs.writeJSON(path.join(packageDir, '.fpi.index.json'), {
+      'index-version': 2,
+      files: files.map((filename) => ({
+        filename,
+        resourceType: 'ValueSet',
+        id: filename,
+        url: `http://example.org/${filename}`,
+        name: filename,
+        version: '1.0.0',
+      })),
+    });
+
+    const firstInstaller = new FhirPackageInstaller({ cachePath: materializationCachePath, registryUrl: 'n/a', logger: noopLogger });
+    const secondInstaller = new FhirPackageInstaller({ cachePath: materializationCachePath, registryUrl: 'n/a', logger: noopLogger });
+    const readdirSpy = vi.spyOn(fs, 'readdir');
+
+    try {
+      expect(await firstInstaller.isInstalled(testPkg, { deep: false })).toBe(true);
+      expect(await fs.exists(markerPath)).toBe(true);
+
+      const firstReaddirCount = readdirSpy.mock.calls.length;
+      readdirSpy.mockClear();
+
+      expect(await secondInstaller.isInstalled(testPkg, { deep: false })).toBe(true);
+      const secondReaddirCount = readdirSpy.mock.calls.length;
+
+      expect(firstReaddirCount).toBe(1);
+      expect(secondReaddirCount).toBe(0);
+    } finally {
+      readdirSpy.mockRestore();
+      await fs.remove(materializationCachePath);
+    }
+  }, TIMEOUT);
+
+  it('should fall back to a full inspection when a persisted materialization marker becomes stale', async () => {
+    const materializationCachePath = createTempDir();
+    const packageRoot = path.join(materializationCachePath, `${testPkg.id}#${testPkg.version}`);
+    const packageDir = path.join(packageRoot, 'package');
+    const missingFilename = 'ValueSet-missing.json';
+
+    await fs.ensureDir(packageDir);
+    await fs.writeJSON(path.join(packageDir, 'package.json'), {
+      name: testPkg.id,
+      version: testPkg.version,
+      dependencies: {},
+    });
+    await fs.writeJSON(path.join(packageDir, missingFilename), {
+      resourceType: 'ValueSet',
+      id: 'missing',
+      url: 'http://example.org/missing',
+      name: 'missing',
+      version: '1.0.0',
+    });
+    await fs.writeJSON(path.join(packageDir, '.fpi.index.json'), {
+      'index-version': 2,
+      files: [{
+        filename: missingFilename,
+        resourceType: 'ValueSet',
+        id: 'missing',
+        url: 'http://example.org/missing',
+        name: 'missing',
+        version: '1.0.0',
+      }],
+    });
+
+    const firstInstaller = new FhirPackageInstaller({ cachePath: materializationCachePath, registryUrl: 'n/a', logger: noopLogger });
+    const secondInstaller = new FhirPackageInstaller({ cachePath: materializationCachePath, registryUrl: 'n/a', logger: noopLogger });
+
+    try {
+      expect(await firstInstaller.isInstalled(testPkg, { deep: false })).toBe(true);
+
+      await fs.remove(path.join(packageDir, missingFilename));
+
+      expect(await secondInstaller.isInstalled(testPkg, { deep: false })).toBe(false);
+    } finally {
+      await fs.remove(materializationCachePath);
+    }
+  }, TIMEOUT);
+
   it('should install the same package concurrently across processes into one shared cache', async () => {
     const sharedCachePath = createTempDir();
 
@@ -420,6 +593,76 @@ describe('fhir-package-installer module', () => {
     }
   }, TIMEOUT);
 
+  it('should log package-install lock contention and wait-state checks at debug level', async () => {
+    const sharedCachePath = createTempDir();
+    const debugMessages: string[] = [];
+    const debugLogger: Logger = {
+      debug: (message) => debugMessages.push(String(message)),
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    };
+    const debugFpi = new FhirPackageInstaller({
+      cachePath: sharedCachePath,
+      skipExamples: true,
+      allowHttp: true,
+      registryUrl: registry.getBaseUrl(),
+      logger: debugLogger,
+    });
+
+    try {
+      const debugFpiAny = debugFpi as any;
+      const locksDir = await debugFpiAny.ensureDiskCacheSubdir('locks');
+      const lockKey = debugFpiAny.getPackageInstallLockKey(testPkg);
+      const lockPath = path.join(locksDir, `${crypto.createHash('sha256').update(lockKey).digest('hex')}.lock`);
+      await fs.writeFile(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: 'wx' });
+
+      const packageDir = path.join(sharedCachePath, `${testPkg.id}#${testPkg.version}`, 'package');
+      const materializeWhileWaiting = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await fs.ensureDir(packageDir);
+        await fs.writeJSON(path.join(packageDir, 'package.json'), {
+          name: testPkg.id,
+          version: testPkg.version,
+          dependencies: {},
+        });
+        await fs.writeJSON(path.join(packageDir, 'ValueSet-test.json'), {
+          resourceType: 'ValueSet',
+          id: 'test',
+          url: 'http://example.org/ValueSet/test',
+          name: 'TestVS',
+          version: '1.0.0',
+        });
+        await fs.writeJSON(path.join(packageDir, '.fpi.index.json'), {
+          'index-version': 2,
+          files: [
+            {
+              filename: 'ValueSet-test.json',
+              resourceType: 'ValueSet',
+              id: 'test',
+              url: 'http://example.org/ValueSet/test',
+              name: 'TestVS',
+              version: '1.0.0',
+            },
+          ],
+        });
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await fs.remove(lockPath).catch(() => undefined);
+      })();
+
+      await expect(debugFpi.install(testPkg)).resolves.toBe(true);
+      await materializeWhileWaiting;
+
+      const joinedLogs = debugMessages.join('\n');
+      expect(joinedLogs).toContain('Another process holds package install test.pkg@1.0.0; entering wait loop.');
+      expect(joinedLogs).toContain('Current materialization state: materialization=incomplete reason=package-root-missing.');
+      expect(joinedLogs).toContain('Still waiting for package install test.pkg@1.0.0');
+      expect(joinedLogs).toContain('Package test.pkg@1.0.0 was materialized while waiting for the package install lock; skipping download and using the shared cache entry.');
+    } finally {
+      await fs.remove(sharedCachePath);
+    }
+  }, TIMEOUT);
+
   it('should install a dependency chain concurrently across processes into one shared cache', async () => {
     const sharedCachePath = createTempDir();
 
@@ -437,6 +680,42 @@ describe('fhir-package-installer module', () => {
 
       await expectMaterializedPackage(sharedCachePath, rootPkg, ['StructureDefinition-root.json']);
       await expectMaterializedPackage(sharedCachePath, depPkg, ['StructureDefinition-dep.json']);
+    } finally {
+      await fs.remove(sharedCachePath);
+    }
+  }, TIMEOUT);
+
+  it('should distribute sibling dependency installs across concurrent workers', async () => {
+    const sharedCachePath = createTempDir();
+
+    try {
+      const results = await runConcurrentInstallWorkers({
+        packageId: `${branchRootPkg.id}@${branchRootPkg.version}`,
+        cachePath: sharedCachePath,
+        registryUrl: registry.getBaseUrl(),
+        workerCount: 2,
+        loggerMode: 'debug',
+      });
+
+      for (const result of results) {
+        expect(result.code).toBe(0);
+        expect(result.payload).toMatchObject({ workerId: String(result.workerId), ok: true });
+      }
+
+      await expectMaterializedPackage(sharedCachePath, branchRootPkg, ['StructureDefinition-branch-root.json']);
+      await expectMaterializedPackage(sharedCachePath, branchDepAPkg, ['StructureDefinition-branch-a.json']);
+      await expectMaterializedPackage(sharedCachePath, branchDepBPkg, ['StructureDefinition-branch-b.json']);
+
+      const depAWorkerIds = results
+        .filter((result) => result.stdout.includes(`Installed ${branchDepAPkg.id}@${branchDepAPkg.version} in the FHIR package cache`))
+        .map((result) => result.workerId);
+      const depBWorkerIds = results
+        .filter((result) => result.stdout.includes(`Installed ${branchDepBPkg.id}@${branchDepBPkg.version} in the FHIR package cache`))
+        .map((result) => result.workerId);
+
+      expect(depAWorkerIds).toHaveLength(1);
+      expect(depBWorkerIds).toHaveLength(1);
+      expect(depAWorkerIds[0]).not.toBe(depBWorkerIds[0]);
     } finally {
       await fs.remove(sharedCachePath);
     }
