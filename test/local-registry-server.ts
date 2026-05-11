@@ -131,12 +131,28 @@ export function createLocalRegistryServer(
               'Content-Type': 'application/octet-stream',
               'Content-Length': String(tgz.length),
             };
+            let tarballTimeout: ReturnType<typeof setTimeout> | undefined;
+            let tarballClosed = false;
+            const clearTarballTimeout = () => {
+              tarballClosed = true;
+              if (tarballTimeout) {
+                clearTimeout(tarballTimeout);
+                tarballTimeout = undefined;
+              }
+            };
+            req.on('aborted', clearTarballTimeout);
+            res.on('close', clearTarballTimeout);
             const send = () => {
+              if (tarballClosed) {
+                return;
+              }
+              tarballTimeout = undefined;
               res.writeHead(200, headers);
               res.end(tgz);
             };
             if (version.tarballDelayMs && version.tarballDelayMs > 0) {
-              setTimeout(send, version.tarballDelayMs);
+              tarballTimeout = setTimeout(send, version.tarballDelayMs);
+              tarballTimeout.unref?.();
             } else {
               send();
             }

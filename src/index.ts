@@ -1149,6 +1149,8 @@ export class FhirPackageInstaller {
       }
 
       return await this.persistMaterializedPackageIndex(packageObject, packageDir, legacyIndex);
+    }, {
+      proceedWithoutLockAfterTimeout: false,
     });
   }
 
@@ -1182,6 +1184,8 @@ export class FhirPackageInstaller {
 
           const indexJson = await this.buildPackageIndexFromPackageDir(packageDir);
           return await this.persistMaterializedPackageIndex(packageObject, packageDir, indexJson);
+        }, {
+          proceedWithoutLockAfterTimeout: false,
         });
       },
       (indexJson) => `fileCount=${indexJson.files.length}`
@@ -1200,6 +1204,7 @@ export class FhirPackageInstaller {
       | 'manifest-invalid'
       | 'index-missing'
       | 'index-invalid'
+      | 'complete'
       | 'indexed-files-missing';
     missingFiles: string[];
   }> {
@@ -1212,6 +1217,7 @@ export class FhirPackageInstaller {
         | 'manifest-invalid'
         | 'index-missing'
         | 'index-invalid'
+        | 'complete'
         | 'indexed-files-missing';
       missingFiles: string[];
     }> => {
@@ -1242,11 +1248,11 @@ export class FhirPackageInstaller {
           if (!legacyMaterializedIndex) {
             return { complete: false, reason: 'index-missing', missingFiles: [] };
           }
-          return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+          return { complete: true, reason: 'complete', missingFiles: [] };
         }
 
         if (await this.hasFreshMaterializationMarker(packageRoot, packageDir, manifestPath, indexPath)) {
-          return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+          return { complete: true, reason: 'complete', missingFiles: [] };
         }
 
         let indexJson: Partial<PackageIndex>;
@@ -1279,7 +1285,7 @@ export class FhirPackageInstaller {
 
         await this.writeMaterializationMarker(packageRoot, packageDir, manifestPath, indexPath);
 
-        return { complete: true, reason: 'indexed-files-missing', missingFiles: [] };
+        return { complete: true, reason: 'complete', missingFiles: [] };
     };
 
     if (!options?.emitTiming) {
@@ -2841,7 +2847,6 @@ export class FhirPackageInstaller {
           cachePath: this.cachePath,
           causes: ['No installed versions available for planning fallback.']
         });
-        implicitResolutionFailureCache.set(this.getImplicitEffectiveCacheKey(packageName), failure, this.registryTtlMs);
         implicitResolutionFailureCache.set(cacheKey, failure, this.registryTtlMs);
         throw failure;
       };
@@ -2911,7 +2916,6 @@ export class FhirPackageInstaller {
         cachePath: this.cachePath,
         causes,
       });
-      implicitResolutionFailureCache.set(this.getImplicitEffectiveCacheKey(packageName), failure, this.registryTtlMs);
       implicitResolutionFailureCache.set(cacheKey, failure, this.registryTtlMs);
       throw failure;
     });
