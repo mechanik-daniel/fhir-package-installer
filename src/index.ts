@@ -76,6 +76,7 @@ const DEPENDENCY_CLAIM_WAIT_MS = 1000;
 const DEPENDENCY_POST_CLAIM_YIELD_MS = 500;
 const DEPENDENCY_WAIT_LOG_INTERVAL_MS = 5000;
 const PACKAGE_INSTALL_WAIT_LOG_INTERVAL_MS = 5000;
+const DEPENDENCY_PEER_HANDOFF_WAIT_MS = 3000;
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
@@ -847,6 +848,96 @@ export class FhirPackageInstaller {
 
   private getPackageInstallLockKey(packageObject: FhirPackageIdentifier): string {
     return `package-install|${packageObject.id}#${packageObject.version}`;
+  }
+
+  private async getInstallParticipantDir(packageObject: FhirPackageIdentifier): Promise<string> {
+    const participantsRoot = await this.ensureDiskCacheSubdir('installers');
+    return path.join(participantsRoot, sha256Hex(`install-participants|${this.getPackageKey(packageObject)}`));
+  }
+
+  private async withInstallParticipant<T>(packageObject: FhirPackageIdentifier, fn: () => Promise<T>): Promise<T> {
+    const participantsDir = await this.getInstallParticipantDir(packageObject);
+    const participantPath = path.join(
+      participantsDir,
+      `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.participant`
+    );
+
+    await fs.ensureDir(participantsDir);
+    await fs.writeFile(participantPath, `${process.pid}\n${Date.now()}\n`, 'utf8');
+
+    const heartbeat = setInterval(() => {
+      fs.utimes(participantPath, new Date(), new Date()).catch(() => undefined);
+    }, 1000);
+    (heartbeat as any).unref?.();
+
+    try {
+      return await fn();
+    } finally {
+      clearInterval(heartbeat);
+      await fs.remove(participantPath).catch(() => undefined);
+    }
+  }
+
+  private async countActiveInstallParticipants(packageObject: FhirPackageIdentifier): Promise<number> {
+    const participantsDir = await this.getInstallParticipantDir(packageObject);
+    if (!await fs.exists(participantsDir)) {
+      return 0;
+    }
+
+    const staleMs = Math.max(2 * 60 * 1000, this.requestTimeoutMs * 2);
+    const now = Date.now();
+    const entries = await fs.readdir(participantsDir);
+    let activeCount = 0;
+
+    for (const entry of entries) {
+      const entryPath = path.join(participantsDir, entry);
+      try {
+        const stat = await fs.stat(entryPath);
+        if (now - stat.mtimeMs <= staleMs) {
+          activeCount += 1;
+        } else {
+          await fs.remove(entryPath).catch(() => undefined);
+        }
+      } catch {
+        // Ignore disappearing or unreadable participant entries.
+      }
+    }
+
+    return activeCount;
+  }
+
+  private async isPackageInstallLockHeld(packageObject: FhirPackageIdentifier): Promise<boolean> {
+    const locksDir = await this.ensureDiskCacheSubdir('locks');
+    const lockPath = path.join(locksDir, `${sha256Hex(this.getPackageInstallLockKey(packageObject))}.lock`);
+    return await fs.exists(lockPath);
+  }
+
+  private async waitForPeerDependencyHandoff(
+    rootPackage: FhirPackageIdentifier,
+    pendingDependencies: FhirPackageIdentifier[]
+  ): Promise<void> {
+    if (pendingDependencies.length === 0) {
+      return;
+    }
+
+    if (await this.countActiveInstallParticipants(rootPackage) <= 1) {
+      return;
+    }
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < DEPENDENCY_PEER_HANDOFF_WAIT_MS) {
+      for (const dependency of pendingDependencies) {
+        if (await this.isStrictlyMaterialized(dependency) || await this.isPackageInstallLockHeld(dependency)) {
+          return;
+        }
+      }
+
+      if (await this.countActiveInstallParticipants(rootPackage) <= 1) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
 
   private async withPackageInstallLock<T>(
@@ -3110,23 +3201,24 @@ export class FhirPackageInstaller {
       return true;
     }
 
-    return await this.withDebugTiming(
-      `install ${this.formatPackageForDebug(packageObject)}`,
-      async () => {
-        await this.withPackageInstallLock(packageObject, async () => {
-          await this.materializePackageWithoutDependencies(packageObject);
-          return true;
-        });
+    return await this.withInstallParticipant(packageObject, async () => {
+      return await this.withDebugTiming(
+        `install ${this.formatPackageForDebug(packageObject)}`,
+        async () => {
+          await this.withPackageInstallLock(packageObject, async () => {
+            return await this.materializePackageWithoutDependencies(packageObject);
+          });
 
-        this.installingPackages.add(packageKey);
-        try {
-          await this.installPackageDependencies(packageObject);
-          return true;
-        } finally {
-          this.installingPackages.delete(packageKey);
+          this.installingPackages.add(packageKey);
+          try {
+            await this.installPackageDependencies(packageObject);
+            return true;
+          } finally {
+            this.installingPackages.delete(packageKey);
+          }
         }
-      }
-    );
+      );
+    });
   }
 
   private async materializePackageWithoutDependencies(packageObject: FhirPackageIdentifier): Promise<boolean> {
@@ -3191,6 +3283,7 @@ export class FhirPackageInstaller {
 
           for (const [dependencyKey, dependency] of dependencyQueue) {
             const installed = completedLocally.has(dependencyKey)
+              || await this.isStrictlyMaterialized(dependency)
               || (claimedElsewhere.has(dependencyKey) && await this.isStrictlyMaterialized(dependency));
             if (installed) {
               continue;
@@ -3204,11 +3297,18 @@ export class FhirPackageInstaller {
           }
 
           let claimedWork = false;
+          let claimedDependencyKey: string | null = null;
           for (const dependency of pending) {
             const dependencyKey = this.getPackageKey(dependency);
+
+            if (await this.isStrictlyMaterialized(dependency)) {
+              claimedElsewhere.delete(dependencyKey);
+              completedLocally.add(dependencyKey);
+              continue;
+            }
+
             const claim = await this.tryWithPackageInstallLock(dependency, async () => {
-              await this.materializePackageWithoutDependencies(dependency);
-              return true;
+              return await this.materializePackageWithoutDependencies(dependency);
             });
 
             if (!claim.acquired) {
@@ -3217,15 +3317,28 @@ export class FhirPackageInstaller {
             }
 
             claimedElsewhere.delete(dependencyKey);
+
+            if (!claim.result) {
+              completedLocally.add(dependencyKey);
+              continue;
+            }
+
             completedLocally.add(dependencyKey);
             this.logger.debug?.(
               `Claimed dependency work item ${this.formatPackageForDebug(dependency)} while installing ${this.formatPackageForDebug(packageObject)}.`
             );
+            claimedDependencyKey = dependencyKey;
             claimedWork = true;
             break;
           }
 
           if (claimedWork) {
+            if (pending.length > 1 && claimedDependencyKey) {
+              const remainingPending = pending.filter(
+                (dependency) => this.getPackageKey(dependency) !== claimedDependencyKey
+              );
+              await this.waitForPeerDependencyHandoff(packageObject, remainingPending);
+            }
             if (pending.length > 1) {
               await new Promise((resolve) => setTimeout(resolve, DEPENDENCY_POST_CLAIM_YIELD_MS));
             }
