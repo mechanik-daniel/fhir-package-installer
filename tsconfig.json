@@ -19,7 +19,6 @@
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
     "moduleResolution": "node",
-    "ignoreDeprecations": "6.0",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "experimentalDecorators": false,

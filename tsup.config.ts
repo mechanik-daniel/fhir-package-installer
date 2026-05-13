@@ -18,7 +18,7 @@ export default defineConfig({
   clean: true,
   target: 'node18',
   minify: false,
-  treeshake: true,
+  treeshake: false,
   skipNodeModulesBundle: true,
   noExternal: ['p-limit', 'yocto-queue'],
   splitting: false,
