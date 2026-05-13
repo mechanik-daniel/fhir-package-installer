@@ -1357,6 +1357,28 @@ export class FhirPackageInstaller {
     );
   }
 
+  private isAlreadyExistsError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+
+    const candidate = error as { code?: string; message?: string };
+    return candidate.code === 'EEXIST'
+      || candidate.code === 'ENOTEMPTY'
+      || /dest already exists/i.test(candidate.message ?? '');
+  }
+
+  private isRetryableStagePublishError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+
+    const candidate = error as { code?: string };
+    return candidate.code === 'EACCES'
+      || candidate.code === 'EPERM'
+      || candidate.code === 'EBUSY';
+  }
+
   private getDiskCacheKeyPrefix(): string {
     // Avoid accidental cross-registry pollution for metadata/tarballs.
     return `${this.registryUrl}`;
@@ -2385,7 +2407,30 @@ export class FhirPackageInstaller {
           return finalPath;
         }
 
-        const stagingPath = await this.stagePackageForPublish(packageObject, src, move);
+        let stagingPath: string | null = null;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          try {
+            stagingPath = await this.stagePackageForPublish(packageObject, src, move);
+            break;
+          } catch (e: any) {
+            if (await this.isStrictlyMaterialized(packageObject)) {
+              return finalPath;
+            }
+
+            const canRetry = this.isRetryableStagePublishError(e) && attempt < 2;
+            if (!canRetry) {
+              throw e;
+            }
+
+            this.logger.warn?.(
+              `Retrying publish staging for ${packageObject.id}@${packageObject.version} after ${e?.code || e?.message || String(e)}.`
+            );
+          }
+        }
+
+        if (!stagingPath) {
+          return finalPath;
+        }
 
         try {
           const existingState = await this.getPackageMaterializationStatus(packageObject);
@@ -2396,7 +2441,7 @@ export class FhirPackageInstaller {
           try {
             await fs.move(stagingPath, finalPath, { overwrite: false });
           } catch (e: any) {
-            if (e?.code === 'EEXIST') {
+            if (this.isAlreadyExistsError(e)) {
               const stateAfterCollision = await this.getPackageMaterializationStatus(packageObject);
               if (stateAfterCollision.complete) {
                 this.logger.warn(`Package ${packageObject.id}@${packageObject.version} already installed by another process`);

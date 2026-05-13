@@ -258,4 +258,88 @@ describe('concurrency regressions', () => {
     expect(install).toHaveBeenCalledWith({ id: 'hl7.terminology.r4', version: '7.1.0' });
     expect(isStrictlyMaterialized).toHaveBeenCalledWith({ id: 'hl7.terminology.r4', version: '7.1.0' });
   });
+
+  it('retries transient staging publish errors without re-entering a new install pass', async () => {
+    const cachePath = createTempDir();
+    const installer = new FhirPackageInstaller({
+      cachePath,
+      logger: noopLogger,
+    });
+    const packageObject = { id: 'hl7.fhir.r4.core', version: '4.0.1' };
+    const stagingPath = path.join(cachePath, '.fpi.cache', 'staging', 'hl7.fhir.r4.core#4.0.1.test');
+    const finalPath = path.join(cachePath, 'hl7.fhir.r4.core#4.0.1');
+    const transientError = new Error('permission denied') as Error & { code?: string };
+    transientError.code = 'EACCES';
+
+    const isStrictlyMaterialized = vi
+      .spyOn(installer as any, 'isStrictlyMaterialized')
+      .mockResolvedValue(false);
+    const stagePackageForPublish = vi
+      .spyOn(installer as any, 'stagePackageForPublish')
+      .mockRejectedValueOnce(transientError)
+      .mockResolvedValueOnce(stagingPath);
+    const getPackageMaterializationStatus = vi
+      .spyOn(installer as any, 'getPackageMaterializationStatus')
+      .mockResolvedValue({ complete: false, reason: 'package-root-missing', missingFiles: [] });
+    const move = vi
+      .spyOn(fs, 'move')
+      .mockImplementation(async (src: string, dest: string) => {
+        expect(src).toBe(stagingPath);
+        expect(dest).toBe(finalPath);
+      });
+
+    try {
+      await expect((installer as any).cachePackage(packageObject, path.join(cachePath, 'src'))).resolves.toBe(finalPath);
+      expect(stagePackageForPublish).toHaveBeenCalledTimes(2);
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(isStrictlyMaterialized).toHaveBeenCalled();
+      expect(getPackageMaterializationStatus).toHaveBeenCalledTimes(1);
+    } finally {
+      move.mockRestore();
+      getPackageMaterializationStatus.mockRestore();
+      stagePackageForPublish.mockRestore();
+      isStrictlyMaterialized.mockRestore();
+      await fs.remove(cachePath).catch(() => undefined);
+    }
+  });
+
+  it('treats generic dest already exists publish collisions as a concurrent winner', async () => {
+    const cachePath = createTempDir();
+    const installer = new FhirPackageInstaller({
+      cachePath,
+      logger: noopLogger,
+    });
+    const packageObject = { id: 'hl7.fhir.r4.core', version: '4.0.1' };
+    const stagingPath = path.join(cachePath, '.fpi.cache', 'staging', 'hl7.fhir.r4.core#4.0.1.test');
+    const finalPath = path.join(cachePath, 'hl7.fhir.r4.core#4.0.1');
+    const collisionError = new Error('dest already exists.');
+
+    const isStrictlyMaterialized = vi
+      .spyOn(installer as any, 'isStrictlyMaterialized')
+      .mockResolvedValue(false);
+    const stagePackageForPublish = vi
+      .spyOn(installer as any, 'stagePackageForPublish')
+      .mockResolvedValue(stagingPath);
+    const getPackageMaterializationStatus = vi
+      .spyOn(installer as any, 'getPackageMaterializationStatus')
+      .mockResolvedValueOnce({ complete: false, reason: 'package-root-missing', missingFiles: [] })
+      .mockResolvedValueOnce({ complete: true, reason: 'complete', missingFiles: [] });
+    const move = vi
+      .spyOn(fs, 'move')
+      .mockRejectedValue(collisionError);
+
+    try {
+      await expect((installer as any).cachePackage(packageObject, path.join(cachePath, 'src'))).resolves.toBe(finalPath);
+      expect(stagePackageForPublish).toHaveBeenCalledTimes(1);
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(getPackageMaterializationStatus).toHaveBeenCalledTimes(2);
+      expect(isStrictlyMaterialized).toHaveBeenCalledTimes(1);
+    } finally {
+      move.mockRestore();
+      getPackageMaterializationStatus.mockRestore();
+      stagePackageForPublish.mockRestore();
+      isStrictlyMaterialized.mockRestore();
+      await fs.remove(cachePath).catch(() => undefined);
+    }
+  });
 });
