@@ -1566,7 +1566,7 @@ export class FhirPackageInstaller {
       return (await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir)) !== null;
     }
 
-    return false;
+    return true;
   }
 
   private async isStrictlyMaterialized(packageObject: FhirPackageIdentifier): Promise<boolean> {
@@ -1583,18 +1583,24 @@ export class FhirPackageInstaller {
     }
   }
 
-  private async collectMissingPackages(root: FhirPackageIdentifier): Promise<string[]> {
+  private async collectMissingPackages(
+    root: FhirPackageIdentifier,
+    options?: { requireStrictMaterialization?: boolean }
+  ): Promise<string[]> {
     const missing: string[] = [];
     const visited = new Set<string>();
     const { explicitImplicitVersions } = await this.collectExplicitDependencyClosure(root);
+    const requireStrictMaterialization = options?.requireStrictMaterialization === true;
 
     const visit = async (pkg: FhirPackageIdentifier) => {
       const key = `${pkg.id}#${pkg.version}`;
       if (visited.has(key)) return;
       visited.add(key);
 
-      const isMaterialized = await this.isInstalled(pkg, { deep: false });
-      if (!isMaterialized) {
+      const isInstalled = requireStrictMaterialization
+        ? await this.isStrictlyMaterialized(pkg)
+        : await this.isInstalled(pkg, { deep: false });
+      if (!isInstalled) {
         missing.push(key);
         return;
       }
@@ -3191,7 +3197,7 @@ export class FhirPackageInstaller {
     // Registry disabled mode: never attempt downloads.
     // All required packages (including transitive + implicit deps) must already exist.
     if (this.isRegistryDisabled()) {
-      const missing = await this.collectMissingPackages(packageObject);
+      const missing = await this.collectMissingPackages(packageObject, { requireStrictMaterialization: true });
       if (missing.length > 0) {
         const preview = missing.slice(0, 10).join(', ');
         const suffix = missing.length > 10 ? ` (and ${missing.length - 10} more)` : '';
@@ -3408,7 +3414,7 @@ export class FhirPackageInstaller {
     }
 
     return await this.withPackageInstallLock(packageObject, async () => {
-      const alreadyInstalled = await this.isInstalled(packageObject, { deep: false });
+      const alreadyInstalled = await this.isStrictlyMaterialized(packageObject);
       if (alreadyInstalled && !options?.override) {
         this.logger.info(`Package ${packageObject.id}@${packageObject.version} is already installed`);
         return false;
