@@ -430,7 +430,7 @@ export class FhirPackageInstaller {
     action: () => Promise<T>,
     describeResult?: (result: T) => string
   ): Promise<T> {
-    if (!this.logger.debug) {
+    if (!this.logger.debug || typeof this.logger.debug !== 'function') {
       return await action();
     }
 
