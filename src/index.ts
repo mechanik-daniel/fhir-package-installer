@@ -77,6 +77,7 @@ const DEPENDENCY_POST_CLAIM_YIELD_MS = 500;
 const DEPENDENCY_WAIT_LOG_INTERVAL_MS = 5000;
 const PACKAGE_INSTALL_WAIT_LOG_INTERVAL_MS = 5000;
 const DEPENDENCY_PEER_HANDOFF_WAIT_MS = 3000;
+const DEPENDENCY_PEER_DISCOVERY_GRACE_MS = 300;
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
@@ -920,11 +921,8 @@ export class FhirPackageInstaller {
       return;
     }
 
-    if (await this.countActiveInstallParticipants(rootPackage) <= 1) {
-      return;
-    }
-
     const startedAt = Date.now();
+    let peerDiscoveryGraceApplied = false;
     while (Date.now() - startedAt < DEPENDENCY_PEER_HANDOFF_WAIT_MS) {
       for (const dependency of pendingDependencies) {
         if (await this.isStrictlyMaterialized(dependency) || await this.isPackageInstallLockHeld(dependency)) {
@@ -933,6 +931,11 @@ export class FhirPackageInstaller {
       }
 
       if (await this.countActiveInstallParticipants(rootPackage) <= 1) {
+        if (!peerDiscoveryGraceApplied) {
+          peerDiscoveryGraceApplied = true;
+          await new Promise((resolve) => setTimeout(resolve, DEPENDENCY_PEER_DISCOVERY_GRACE_MS));
+          continue;
+        }
         return;
       }
 
