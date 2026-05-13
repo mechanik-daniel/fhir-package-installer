@@ -1566,7 +1566,7 @@ export class FhirPackageInstaller {
       return (await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir)) !== null;
     }
 
-    return true;
+    return false;
   }
 
   private async isStrictlyMaterialized(packageObject: FhirPackageIdentifier): Promise<boolean> {
