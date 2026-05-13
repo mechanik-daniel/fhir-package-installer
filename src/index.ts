@@ -2580,6 +2580,40 @@ export class FhirPackageInstaller {
     return await fs.readJSON(manifestPath, { encoding: 'utf8' });
   }
 
+  private async waitForManifestDuringActiveInstall(
+    packageObject: FhirPackageIdentifier,
+    packageFolder: string
+  ): Promise<PackageManifest | null> {
+    const deadline = Date.now() + Math.max(this.requestTimeoutMs, 250);
+
+    while (Date.now() < deadline) {
+      try {
+        return await this.readManifestFile(packageFolder);
+      } catch (err: any) {
+        const code = err?.code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+          throw err;
+        }
+      }
+
+      if (!await this.isPackageInstallLockHeld(packageObject)) {
+        break;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    try {
+      return await this.readManifestFile(packageFolder);
+    } catch (err: any) {
+      const code = err?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        return null;
+      }
+      throw err;
+    }
+  }
+
   public async getManifest(packageId: string | FhirPackageIdentifier): Promise<PackageManifest> {
     const packageObj = typeof packageId === 'string' 
       ? await this.toPackageObject(packageId)
@@ -2592,6 +2626,13 @@ export class FhirPackageInstaller {
     } catch (err: any) {
       const code = err?.code;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
+        if (await this.isPackageInstallLockHeld(packageObj)) {
+          const manifest = await this.waitForManifestDuringActiveInstall(packageObj, packageFolder);
+          if (manifest) {
+            return manifest;
+          }
+        }
+
         if (IMPLICIT_PACKAGE_IDS.has(packageObj.id)) {
           for (const cacheKey of this.getImplicitPlanningCacheKeys(packageObj.id)) {
             const implicitFailure = implicitResolutionFailureCache.get(cacheKey);
@@ -2682,13 +2723,18 @@ export class FhirPackageInstaller {
       }
 
       try {
-        const resolveFromInstalled = async (detail: string): Promise<string> => {
+        const resolveFromInstalled = async (
+          detail: string,
+          previousAttempts?: { attemptedVersions: string[]; causes: string[] }
+        ): Promise<string> => {
           this.logger.warn?.(detail);
           const installedVersions = await this.getInstalledVersions(packageName);
-          const attempted: string[] = [];
-          const causes: string[] = [];
+          const attempted = [...(previousAttempts?.attemptedVersions ?? [])];
+          const causes = [...(previousAttempts?.causes ?? [])];
           for (const version of installedVersions) {
-            attempted.push(version);
+            if (!attempted.includes(version)) {
+              attempted.push(version);
+            }
             try {
               const ok = await this.hasReadableManifest({ id: packageName, version });
               if (ok) {
@@ -2699,6 +2745,10 @@ export class FhirPackageInstaller {
             } catch (error: any) {
               causes.push(`${version}: ${error?.message || String(error)}`);
             }
+          }
+
+          if (installedVersions.length === 0) {
+            causes.push('No installed versions available for fallback.');
           }
 
           throw new ImplicitPackageResolutionError({
@@ -2782,13 +2832,11 @@ export class FhirPackageInstaller {
           }
         }
 
-        throw new ImplicitPackageResolutionError({
-          packageId: packageName,
-          attemptedVersions,
-          registryUrl: this.registryUrl,
-          cachePath: this.cachePath,
-          causes,
-        });
+        return await resolveFromInstalled(
+          `Failed to materialize implicit package ${packageName} from registry candidates. ` +
+          'Falling back to latest installed version (if available).',
+          { attemptedVersions, causes }
+        );
       } catch (error: any) {
         if (error instanceof ImplicitPackageResolutionError) {
           implicitResolutionFailureCache.set(cacheKey, error, this.registryTtlMs);
@@ -2839,22 +2887,40 @@ export class FhirPackageInstaller {
         implicitEffectiveVersionCache.delete(cacheKey);
       }
 
-      const resolveFromInstalled = async (detail: string): Promise<string> => {
+      const resolveFromInstalled = async (
+        detail: string,
+        previousAttempts?: { attemptedVersions: string[]; causes: string[] }
+      ): Promise<string> => {
         this.logger.warn?.(detail);
         const installedVersions = await this.getInstalledVersions(packageName);
-        if (installedVersions.length > 0) {
-          const version = installedVersions[0];
-          implicitResolutionFailureCache.delete(cacheKey);
-          implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
-          return version;
+        const attempted = [...(previousAttempts?.attemptedVersions ?? [])];
+        const causes = [...(previousAttempts?.causes ?? [])];
+
+        for (const version of installedVersions) {
+          if (!attempted.includes(version)) {
+            attempted.push(version);
+          }
+
+          try {
+            if (await this.hasReadableManifest({ id: packageName, version })) {
+              implicitResolutionFailureCache.delete(cacheKey);
+              implicitEffectiveVersionCache.set(cacheKey, version, this.registryTtlMs);
+              return version;
+            }
+            causes.push(`${version}: installed manifest missing`);
+          } catch (error: any) {
+            causes.push(`${version}: ${error?.message || String(error)}`);
+          }
         }
 
         const failure = new ImplicitPackageResolutionError({
           packageId: packageName,
-          attemptedVersions: [],
+          attemptedVersions: attempted,
           registryUrl: this.registryUrl,
           cachePath: this.cachePath,
-          causes: ['No installed versions available for planning fallback.']
+          causes: causes.length > 0
+            ? causes
+            : ['No installed versions available for planning fallback.']
         });
         implicitResolutionFailureCache.set(cacheKey, failure, this.registryTtlMs);
         throw failure;
@@ -2918,15 +2984,11 @@ export class FhirPackageInstaller {
         }
       }
 
-      const failure = new ImplicitPackageResolutionError({
-        packageId: packageName,
-        attemptedVersions,
-        registryUrl: this.registryUrl,
-        cachePath: this.cachePath,
-        causes,
-      });
-      implicitResolutionFailureCache.set(cacheKey, failure, this.registryTtlMs);
-      throw failure;
+      return await resolveFromInstalled(
+        `Failed to resolve planning candidates for implicit package ${packageName}. ` +
+        'Falling back to latest installed version (if available).',
+        { attemptedVersions, causes }
+      );
     });
   }
 
