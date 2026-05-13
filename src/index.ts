@@ -3416,8 +3416,7 @@ export class FhirPackageInstaller {
 
       await fs.remove(await this.getPackageDirPath(packageObject));
 
-      const installedPath = await this.cachePackage(packageObject, finalPath, !isDirectory); // if the source is a file, we can move the temp dir to the cache
-      this.logger.info(`Installed ${packageObject.id}@${packageObject.version} in the FHIR package cache: ${installedPath}`);
+      await this.cachePackage(packageObject, finalPath, !isDirectory); // if the source is a file, we can move the temp dir to the cache
 
       if (options?.installDependencies) {
         await this.installPackageDependencies(packageObject);
