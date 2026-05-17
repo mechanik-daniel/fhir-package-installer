@@ -342,4 +342,56 @@ describe('concurrency regressions', () => {
       await fs.remove(cachePath).catch(() => undefined);
     }
   });
+
+  it('repairs a manifest-valid cached package with no .fpi.index.json instead of re-downloading it', async () => {
+    const cachePath = createTempDir();
+    const installer = new FhirPackageInstaller({
+      cachePath,
+      logger: noopLogger,
+    });
+    const packageObject = { id: 'fsg.test.pkg', version: '0.1.0' };
+    const packageDir = path.join(cachePath, 'fsg.test.pkg#0.1.0', 'package');
+    const resourceFile = path.join(packageDir, 'StructureDefinition-ext-hearing-loss.json');
+    const indexPath = path.join(packageDir, '.fpi.index.json');
+
+    await fs.ensureDir(packageDir);
+    await fs.writeJSON(path.join(packageDir, 'package.json'), {
+      name: packageObject.id,
+      version: packageObject.version,
+      dependencies: {},
+    });
+    await fs.writeJSON(resourceFile, {
+      resourceType: 'StructureDefinition',
+      id: 'ext-hearing-loss',
+      url: 'http://example.org/StructureDefinition/ext-hearing-loss',
+      kind: 'complex-type',
+      abstract: false,
+      type: 'Extension',
+      derivation: 'constraint',
+    });
+
+    const downloadAndExtractTarball = vi
+      .spyOn(installer as any, 'downloadAndExtractTarball')
+      .mockRejectedValue(new Error('should not download'));
+
+    try {
+      await expect(installer.install(packageObject)).resolves.toBe(true);
+      expect(downloadAndExtractTarball).not.toHaveBeenCalled();
+      expect(await fs.pathExists(indexPath)).toBe(true);
+
+      const indexJson = await fs.readJSON(indexPath);
+      expect(indexJson.files).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            filename: 'StructureDefinition-ext-hearing-loss.json',
+            resourceType: 'StructureDefinition',
+            id: 'ext-hearing-loss',
+          }),
+        ])
+      );
+    } finally {
+      downloadAndExtractTarball.mockRestore();
+      await fs.remove(cachePath).catch(() => undefined);
+    }
+  });
 });
