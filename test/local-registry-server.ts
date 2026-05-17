@@ -5,6 +5,8 @@ import * as zlib from 'zlib';
 
 export type LocalRegistryPackageVersion = {
   tgz: Buffer;
+  dependencies?: Record<string, string>;
+  tarballDelayMs?: number;
   tarballStatus?: number;
   tarballData?: Buffer;
   tarballErrorBody?: Buffer;
@@ -83,6 +85,7 @@ export function createLocalRegistryServer(
               versions[ver] = {
                 name: pkg,
                 version: ver,
+                ...(p.versions[ver].dependencies ? { dependencies: p.versions[ver].dependencies } : {}),
                 dist: {
                   tarball: `${base}/${pkg}/-/${pkg}-${ver}.tgz`,
                 },
@@ -124,11 +127,35 @@ export function createLocalRegistryServer(
             }
 
             const tgz = version.tarballData ?? version.tgz;
-            res.writeHead(200, {
+            const headers = {
               'Content-Type': 'application/octet-stream',
               'Content-Length': String(tgz.length),
-            });
-            res.end(tgz);
+            };
+            let tarballTimeout: ReturnType<typeof setTimeout> | undefined;
+            let tarballClosed = false;
+            const clearTarballTimeout = () => {
+              tarballClosed = true;
+              if (tarballTimeout) {
+                clearTimeout(tarballTimeout);
+                tarballTimeout = undefined;
+              }
+            };
+            req.on('aborted', clearTarballTimeout);
+            res.on('close', clearTarballTimeout);
+            const send = () => {
+              if (tarballClosed) {
+                return;
+              }
+              tarballTimeout = undefined;
+              res.writeHead(200, headers);
+              res.end(tgz);
+            };
+            if (version.tarballDelayMs && version.tarballDelayMs > 0) {
+              tarballTimeout = setTimeout(send, version.tarballDelayMs);
+              tarballTimeout.unref?.();
+            } else {
+              send();
+            }
             return;
           }
 

@@ -6,6 +6,7 @@
     "declarationMap": false,
     "pretty": true,
     "sourceMap": true,
+    "rootDir": "src",
     "outDir": "dist",
     "importHelpers": true,
     "strict": true,
@@ -20,8 +21,8 @@
     "moduleResolution": "node",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
-  "experimentalDecorators": false,
-  "emitDecoratorMetadata": false,
+    "experimentalDecorators": false,
+    "emitDecoratorMetadata": false,
     "resolveJsonModule": true,
     "allowJs": true
   },
