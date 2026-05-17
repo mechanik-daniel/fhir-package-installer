@@ -1249,9 +1249,15 @@ export class FhirPackageInstaller {
         if (!await fs.exists(indexPath)) {
           const legacyMaterializedIndex = await this.tryMaterializeLegacyPackageIndex(packageObject, packageDir);
           if (!legacyMaterializedIndex) {
-            return { complete: false, reason: 'index-missing', missingFiles: [] };
+            try {
+              await this.materializePackageIndex(packageObject, packageDir);
+            } catch {
+              return { complete: false, reason: 'index-missing', missingFiles: [] };
+            }
+            if (!await fs.exists(indexPath)) {
+              return { complete: false, reason: 'index-missing', missingFiles: [] };
+            }
           }
-          return { complete: true, reason: 'complete', missingFiles: [] };
         }
 
         if (await this.hasFreshMaterializationMarker(packageRoot, packageDir, manifestPath, indexPath)) {
