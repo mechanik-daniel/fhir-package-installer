@@ -24,6 +24,11 @@ function sortIndexEntries(entries: FileInPackageIndex[]): FileInPackageIndex[] {
   return entries.slice().sort((a, b) => a.filename.localeCompare(b.filename));
 }
 
+type PackageIndexFixture = {
+  'index-version': number;
+  files: FileInPackageIndex[];
+};
+
 type ConcurrentInstallWorkerPayload = {
   workerId: string;
   ok?: boolean;
@@ -178,22 +183,94 @@ try {
   return await Promise.all(Array.from({ length: workerCount }, (_, index) => runWorker(index + 1)));
 }
 
-async function expectMaterializedPackage(cachePath: string, packageId: { id: string; version: string }, expectedFiles: string[]): Promise<void> {
+async function readMaterializedPackageIndexes(
+  cachePath: string,
+  packageId: { id: string; version: string }
+): Promise<{
+  packageDir: string;
+  fpiIndex: PackageIndexFixture;
+  legacyIndex: PackageIndexFixture | null;
+}> {
   const packageDir = path.join(cachePath, `${packageId.id}#${packageId.version}`, 'package');
-  const indexPath = path.join(packageDir, '.fpi.index.json');
-  const index = await fs.readJSON(indexPath, { encoding: 'utf8' }) as { files: Array<{ filename: string }> };
+  const fpiIndexPath = path.join(packageDir, '.fpi.index.json');
+  const legacyIndexPath = path.join(packageDir, '.index.json');
 
-  expect(Array.isArray(index.files)).toBe(true);
-  expect(sortIndexEntries(index.files as FileInPackageIndex[]).map((file) => file.filename)).toEqual([...expectedFiles].sort());
+  return {
+    packageDir,
+    fpiIndex: await fs.readJSON(fpiIndexPath, { encoding: 'utf8' }) as PackageIndexFixture,
+    legacyIndex: await fs.exists(legacyIndexPath)
+      ? await fs.readJSON(legacyIndexPath, { encoding: 'utf8' }) as PackageIndexFixture
+      : null,
+  };
+}
+
+async function expectMaterializedPackage(
+  cachePath: string,
+  packageId: { id: string; version: string },
+  expectedFiles: string[],
+  options?: { expectLegacyIndex?: boolean }
+): Promise<{
+  packageDir: string;
+  fpiIndex: PackageIndexFixture;
+  legacyIndex: PackageIndexFixture | null;
+}> {
+  const materialized = await readMaterializedPackageIndexes(cachePath, packageId);
+
+  expect(Array.isArray(materialized.fpiIndex.files)).toBe(true);
+  expect(sortIndexEntries(materialized.fpiIndex.files).map((file) => file.filename)).toEqual([...expectedFiles].sort());
   for (const filename of expectedFiles) {
-    expect(await fs.exists(path.join(packageDir, filename))).toBe(true);
+    expect(await fs.exists(path.join(materialized.packageDir, filename))).toBe(true);
   }
+
+  if (options?.expectLegacyIndex) {
+    expect(materialized.legacyIndex).not.toBeNull();
+    expect(Array.isArray(materialized.legacyIndex?.files)).toBe(true);
+    expect(sortIndexEntries(materialized.legacyIndex!.files).map((file) => file.filename)).toEqual([...expectedFiles].sort());
+  }
+
+  return materialized;
 }
 
 // Keep this for quickly toggling a few edge-case tests while iterating locally.
 const skip = false;
 
 const TIMEOUT = 240000; // 240 seconds timeout for installation
+const tinyPackageExpectedFpiIndex = sortIndexEntries([
+  {
+    filename: 'CodeSystem-test.json',
+    resourceType: 'CodeSystem',
+    id: 'test',
+    url: 'http://example.org/CodeSystem/test',
+    name: 'TestCS',
+    version: '1.0.0',
+    content: 'complete',
+  },
+  {
+    filename: 'ValueSet-test.json',
+    resourceType: 'ValueSet',
+    id: 'test',
+    url: 'http://example.org/ValueSet/test',
+    name: 'TestVS',
+    version: '1.0.0',
+  },
+] as FileInPackageIndex[]);
+const tinyPackageExpectedLegacyIndex = sortIndexEntries([
+  {
+    filename: 'CodeSystem-test.json',
+    resourceType: 'CodeSystem',
+    id: 'test',
+    url: 'http://example.org/CodeSystem/test',
+    version: '1.0.0',
+    content: 'complete',
+  },
+  {
+    filename: 'ValueSet-test.json',
+    resourceType: 'ValueSet',
+    id: 'test',
+    url: 'http://example.org/ValueSet/test',
+    version: '1.0.0',
+  },
+] as FileInPackageIndex[]);
 
 describe('fhir-package-installer module', () => {
   const fakePackage = { id: 'fake-package', version: '1.0.0' };
@@ -381,6 +458,15 @@ describe('fhir-package-installer module', () => {
     const result = await customCacheFpi.install(testPkg);
     expect(result).toBe(true);
     expect(await customCacheFpi.isInstalled(testPkg)).toBe(true);
+
+    const materialized = await expectMaterializedPackage(
+      customCachePath,
+      testPkg,
+      ['CodeSystem-test.json', 'ValueSet-test.json'],
+      { expectLegacyIndex: true }
+    );
+    expect(sortIndexEntries(materialized.fpiIndex.files)).toEqual(tinyPackageExpectedFpiIndex);
+    expect(sortIndexEntries(materialized.legacyIndex!.files)).toEqual(tinyPackageExpectedLegacyIndex);
   }, TIMEOUT);
 
   it('should repair incomplete visible package directories before treating them as installed', async () => {
@@ -486,6 +572,7 @@ describe('fhir-package-installer module', () => {
       ],
     });
     await fs.writeFile(sentinelPath, 'keep-me');
+    const legacyContentsBefore = await fs.readFile(legacyIndexPath, 'utf8');
 
     try {
       expect(await fs.exists(fpiIndexPath)).toBe(false);
@@ -499,6 +586,7 @@ describe('fhir-package-installer module', () => {
 
       const generatedIndex = await fs.readJSON(fpiIndexPath, { encoding: 'utf8' });
       expect(generatedIndex.files).toHaveLength(2);
+      expect(await fs.readFile(legacyIndexPath, 'utf8')).toBe(legacyContentsBefore);
     } finally {
       await fs.remove(compatibilityCachePath);
     }
@@ -806,27 +894,16 @@ describe('fhir-package-installer module', () => {
     expect(generatedIndex['index-version']).toBe(2);
 
     const sorted = sortIndexEntries(generatedIndex.files);
-    expect(sorted).toEqual(
-      sortIndexEntries([
-        {
-          filename: 'CodeSystem-test.json',
-          resourceType: 'CodeSystem',
-          id: 'test',
-          url: 'http://example.org/CodeSystem/test',
-          name: 'TestCS',
-          version: '1.0.0',
-          content: 'complete',
-        },
-        {
-          filename: 'ValueSet-test.json',
-          resourceType: 'ValueSet',
-          id: 'test',
-          url: 'http://example.org/ValueSet/test',
-          name: 'TestVS',
-          version: '1.0.0',
-        },
-      ] as any)
-    );
+    expect(sorted).toEqual(tinyPackageExpectedFpiIndex);
+  });
+
+  it('should keep the generated legacy index strict for the tiny test package', async () => {
+    const { legacyIndex } = await readMaterializedPackageIndexes(customCachePath, testPkg);
+
+    expect(legacyIndex).not.toBeNull();
+    expect(legacyIndex?.['index-version']).toBe(2);
+    expect(sortIndexEntries(legacyIndex!.files)).toEqual(tinyPackageExpectedLegacyIndex);
+    expect(legacyIndex!.files.some((file) => Object.prototype.hasOwnProperty.call(file, 'name'))).toBe(false);
   });
 
 
@@ -840,6 +917,58 @@ describe('fhir-package-installer module', () => {
     expect(generatedIndex['index-version']).toBe(2);
     expect(generatedIndex.files.length).toBeGreaterThan(0);
   });
+
+  it('should recreate missing .index.json on tgz reinstall without changing .fpi.index.json semantics', async () => {
+    const reinstallCachePath = createTempDir();
+    const reinstallFpi = new FhirPackageInstaller({
+      cachePath: reinstallCachePath,
+      skipExamples: true,
+      registryUrl: 'n/a',
+      logger: noopLogger,
+    });
+    const tgzPath = path.join(reinstallCachePath, `${testPkg.id}-${testPkg.version}.tgz`);
+    const tgzBuffer = await createTgzBuffer({
+      'package/package.json': JSON.stringify({ name: testPkg.id, version: testPkg.version, dependencies: {} }),
+      'package/ValueSet-test.json': JSON.stringify({ resourceType: 'ValueSet', id: 'test', url: 'http://example.org/ValueSet/test', name: 'TestVS', version: '1.0.0' }),
+      'package/CodeSystem-test.json': JSON.stringify({ resourceType: 'CodeSystem', id: 'test', url: 'http://example.org/CodeSystem/test', name: 'TestCS', version: '1.0.0', content: 'complete' }),
+    });
+
+    await fs.writeFile(tgzPath, tgzBuffer);
+
+    try {
+      await expect(reinstallFpi.installLocalPackage(tgzPath, { installDependencies: false })).resolves.toBe(true);
+
+      const initial = await expectMaterializedPackage(
+        reinstallCachePath,
+        testPkg,
+        ['CodeSystem-test.json', 'ValueSet-test.json'],
+        { expectLegacyIndex: true }
+      );
+      const legacyIndexPath = path.join(initial.packageDir, '.index.json');
+
+      expect(sortIndexEntries(initial.fpiIndex.files)).toEqual(tinyPackageExpectedFpiIndex);
+      expect(sortIndexEntries(initial.legacyIndex!.files)).toEqual(tinyPackageExpectedLegacyIndex);
+
+      await fs.remove(legacyIndexPath);
+      expect(await fs.exists(legacyIndexPath)).toBe(false);
+
+      await expect(reinstallFpi.installLocalPackage(tgzPath, {
+        override: true,
+        installDependencies: false,
+      })).resolves.toBe(true);
+
+      const regenerated = await expectMaterializedPackage(
+        reinstallCachePath,
+        testPkg,
+        ['CodeSystem-test.json', 'ValueSet-test.json'],
+        { expectLegacyIndex: true }
+      );
+      expect(sortIndexEntries(regenerated.fpiIndex.files)).toEqual(tinyPackageExpectedFpiIndex);
+      expect(sortIndexEntries(regenerated.legacyIndex!.files)).toEqual(tinyPackageExpectedLegacyIndex);
+    } finally {
+      await fs.remove(reinstallCachePath);
+    }
+  }, TIMEOUT);
 
 
   // Test downloadPackage function
