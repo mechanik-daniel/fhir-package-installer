@@ -78,6 +78,19 @@ const DEPENDENCY_WAIT_LOG_INTERVAL_MS = 5000;
 const PACKAGE_INSTALL_WAIT_LOG_INTERVAL_MS = 5000;
 const DEPENDENCY_PEER_HANDOFF_WAIT_MS = 3000;
 const DEPENDENCY_PEER_DISCOVERY_GRACE_MS = 300;
+const STRICT_LEGACY_PACKAGE_INDEX_KEYS = [
+  'filename',
+  'resourceType',
+  'id',
+  'url',
+  'version',
+  'kind',
+  'type',
+  'supplements',
+  'content',
+] as const satisfies ReadonlyArray<keyof FileInPackageIndex>;
+
+type StrictLegacyPackageIndexEntry = Pick<FileInPackageIndex, typeof STRICT_LEGACY_PACKAGE_INDEX_KEYS[number]>;
 
 /**
  * Mapping from core FHIR packages to their implicit dependencies
@@ -1102,13 +1115,49 @@ export class FhirPackageInstaller {
     };
   }
 
+  private toStrictLegacyPackageIndex(indexJson: PackageIndex): PackageIndex {
+    return {
+      'index-version': 2,
+      files: indexJson.files.map((file) => {
+        const legacyFile: Partial<StrictLegacyPackageIndexEntry> = {};
+        for (const key of STRICT_LEGACY_PACKAGE_INDEX_KEYS) {
+          const value = file[key];
+          if (typeof value === 'string') {
+            legacyFile[key] = value;
+          }
+        }
+        return legacyFile as FileInPackageIndex;
+      }),
+    };
+  }
+
+  private async writePackageIndexFiles(packageDir: string, indexJson: PackageIndex): Promise<void> {
+    await fs.writeJSON(path.join(packageDir, '.fpi.index.json'), indexJson);
+
+    const legacyIndexPath = path.join(packageDir, '.index.json');
+    if (await fs.exists(legacyIndexPath)) {
+      return;
+    }
+
+    try {
+      await fs.writeFile(
+        legacyIndexPath,
+        `${JSON.stringify(this.toStrictLegacyPackageIndex(indexJson), null, 2)}\n`,
+        { encoding: 'utf8', flag: 'wx' }
+      );
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') {
+        throw error;
+      }
+    }
+  }
+
   private async persistMaterializedPackageIndex(
     packageObject: FhirPackageIdentifier,
     packageDir: string,
     indexJson: PackageIndex
   ): Promise<PackageIndex> {
-    const indexPath = path.join(packageDir, '.fpi.index.json');
-    await fs.writeJSON(indexPath, indexJson);
+    await this.writePackageIndexFiles(packageDir, indexJson);
 
     const memKey = this.getIndexMemKey(packageObject);
     memSetNoTtl(memKey, indexJson);
@@ -2099,7 +2148,7 @@ export class FhirPackageInstaller {
   }
 
   /**
-   * Extracts a tarball to a temporary directory and generates a new `.fpi.index.json` file.
+   * Extracts a tarball to a temporary directory and generates package index files.
    * The tarball can be a file path or a stream.
    * @param src The source tarball, either a file path or a Readable stream.
    * @returns The path to the temporary directory where the package was extracted.
@@ -2335,7 +2384,7 @@ export class FhirPackageInstaller {
       files: shouldParseForIndex ? indexEntries : (cachedIndex?.files || [])
     };
     const extractedIndexWriteStartedAtNs = process.hrtime.bigint();
-    await fs.writeJSON(path.join(tempDirectory, 'package', '.fpi.index.json'), indexJson);
+    await this.writePackageIndexFiles(path.join(tempDirectory, 'package'), indexJson);
     this.logger.debug?.(
       `[extract] Wrote extracted package index for ${packageLabel} ` +
       `in ${this.formatElapsedMs(extractedIndexWriteStartedAtNs)}ms (fileCount=${indexJson.files.length}).`

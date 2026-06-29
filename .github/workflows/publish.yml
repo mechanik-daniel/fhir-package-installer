@@ -36,5 +36,8 @@ jobs:
       - name: Test
         run: npm run test:light
 
+      - name: Live legacy index regression
+        run: npm run test:live-legacy-index-regression
+
       - name: Publish to npm
         run: npm publish --provenance --access public

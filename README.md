@@ -10,7 +10,8 @@ A utility module for downloading, indexing, caching, and managing [FHIR](https:/
 - Cache downloaded packages locally in the [FHIR Package Cache](https://confluence.hl7.org/spaces/FHIR/pages/66928417/FHIR+Package+Cache) or a custom path if defined in the constructor.
 - Automatically resolve `latest` versions
 - **Automatic implicit dependencies** - Core FHIR packages automatically include terminology and extension packages
-- Generate and retrieve a local index (`.fpi.index.json`) of all FHIR JSON files in the package
+- Generate and retrieve a local enhanced index (`.fpi.index.json`) of all FHIR JSON files in the package
+- Maintain a strict FHIR package spec-compatible legacy index (`.index.json`) when a package does not already ship one
 - Fetch `package.json` manifest and dependencies
 - Recursively install required dependencies
 - Support for private registries including JFrog Artifactory, Nexus, and Azure DevOps
@@ -127,7 +128,7 @@ Fetches the `package.json` manifest of an installed package.
 
 ### `getPackageIndexFile(packageId: string | FhirPackageIdentifier): Promise<PackageIndex>`
 Returns the `.fpi.index.json` content for the package.  
-If the file doesn't exist, it will be generated automatically.
+If the file doesn't exist, it will be generated automatically. This method returns the enhanced FPI index, not the strict legacy `.index.json` compatibility file.
 
 ---
 
@@ -296,14 +297,26 @@ await artifactoryFpi.install('hl7.fhir.us.core@6.1.0');
 
 ---
 
-## Index Format: `.fpi.index.json`
+## Index Files: `.fpi.index.json` and `.index.json`
 
-Each installed package is scanned for JSON files in the `package/` subdirectory (excluding `package.json` and any `[*].index.json` files). A generated index is written to:
+Each installed package is scanned for JSON files in the `package/` subdirectory (excluding `package.json` and any `[*].index.json` files).
+
+FHIR Package Installer maintains two related index files:
+
+- `.fpi.index.json` is the enhanced FPI index returned by `getPackageIndexFile()`.
+- `.index.json` is the strict FHIR package spec-compatible legacy index. It is created only when the package does not already include one.
+
+The enhanced index is written to:
 ```bash
 <packagePath>/package/.fpi.index.json
 ```
 
-Sample structure:
+When the package does not already ship a legacy index, a strict compatibility file is also written to:
+```bash
+<packagePath>/package/.index.json
+```
+
+Sample `.fpi.index.json` structure:
 ```json
 {
   "index-version": 2,
@@ -328,9 +341,10 @@ Sample structure:
 ```
 
 **Notes:**
-- All fields are optional and, with the exception of `filename`, populated directly from the original JSON resource.
-- This index is an enhanced alternative to the [`.index.json`](https://hl7.org/fhir/packages.html#2.1.10.4) format in the FHIR NPM spec.
-- Intended to optimize access to key metadata for tools like validators and template generators.
+- In `.fpi.index.json`, all fields are optional and, with the exception of `filename`, populated directly from the original JSON resource.
+- `.fpi.index.json` is an enhanced alternative to the [`.index.json`](https://hl7.org/fhir/packages.html#2.1.10.4) format in the FHIR NPM spec and is intended to optimize access to key metadata for tools like validators and template generators.
+- Generated `.index.json` files are strict compatibility projections that contain only the FHIR spec field subset: `filename`, `resourceType`, `id`, `url`, `version`, `kind`, `type`, `supplements`, and `content`.
+- Existing package-supplied `.index.json` files are preserved and are not overwritten by FHIR Package Installer.
 
 ---
 
